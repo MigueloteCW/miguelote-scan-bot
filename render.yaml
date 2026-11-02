@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: veraz-telegram-bot
+    runtime: docker
+    plan: free
+    numInstances: 1
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: ENABLE_GMGN
+        value: "0"
+      - key: BOT_DB
+        value: /tmp/veraz.sqlite3
+      - key: ALLOWED_CHAT_IDS
+        sync: false
