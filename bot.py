@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from decimal import Decimal
 
 ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 NA = 'No disponible'
@@ -50,7 +51,7 @@ def fmt(value, money=False, ratio=False):
     if ratio:
         return f'{n * 100:.2f}%'
     if money:
-        return '$' + (f'{n:,.2f}' if abs(n) >= 1 else f'{n:.10g}')
+        return '$' + (f'{n:,.2f}' if abs(n) >= 1 else (format(Decimal(str(n)), 'f').rstrip('0').rstrip('.') if n else '0'))
     return f'{n:,.8f}'.rstrip('0').rstrip('.')
 
 
@@ -230,8 +231,27 @@ def keyboard(mint, pair, preference='dexscreener'):
         [{'text': 'GMGN', 'url': f'https://gmgn.ai/sol/token/{mint}'},
          {'text': 'Solscan', 'url': f'https://solscan.io/token/{mint}'}],
         [{'text': '🔄 Actualizar', 'callback_data': f'scan:{mint}'},
-         {'text': '⚙ Elegir chart', 'callback_data': 'settings'}]
+         {'text': 'ℹ Fuentes', 'callback_data': f'sources:{mint}'},
+         {'text': '⚙ Chart', 'callback_data': 'settings'}]
     ]}
+
+
+def compact(value, money=False):
+    n = number(value)
+    if n is None:
+        return '—'
+    prefix = '$' if money else ''
+    for scale, suffix in ((1e12, 'T'), (1e9, 'B'), (1e6, 'M'), (1e3, 'K')):
+        if abs(n) >= scale:
+            return prefix + f'{n / scale:.2f}'.rstrip('0').rstrip('.') + suffix
+    return fmt(n, money=money)
+
+
+def change(value):
+    n = number(value)
+    if n is None:
+        return '—'
+    return ('🟢 +' if n > 0 else '🔴 ' if n < 0 else '') + f'{n:.2f}'.rstrip('0').rstrip('.') + '%'
 
 
 def card(mint, pair, fetched, info=None, gmgn_note='GMGN pendiente de configurar.'):
@@ -240,28 +260,41 @@ def card(mint, pair, fetched, info=None, gmgn_note='GMGN pendiente de configurar
     tx = (pair.get('txns') or {}).get('h24') or {}
     info = info or {}
     stat, tags = info.get('stat') or {}, info.get('wallet_tags_stat') or {}
-    lines = [f'<b>{esc(base.get("name", "Token"))} ({esc(base.get("symbol", "?"), 25)})</b> · Solana',
-             f'Precio: {fmt(pair.get("priceUsd"), money=True)}',
-             f'MC reportada: {fmt(pair.get("marketCap"), money=True)} | FDV: {fmt(pair.get("fdv"), money=True)}',
-             f'Liquidez del par: {fmt((pair.get("liquidity") or {}).get("usd"), money=True)}',
-             ' · '.join(f'{label}: {fmt(changes.get(key))}' + ('%' if number(changes.get(key)) is not None else '')
-                        for key, label in [('m5', '5m'), ('h1', '1h'), ('h24', '24h')]),
-             f'Volumen 24h del par: {fmt((pair.get("volume") or {}).get("h24"), money=True)}',
-             f'Compras / ventas 24h: {fmt(tx.get("buys"))} / {fmt(tx.get("sells"))}',
-             '', '<b>ATH histórico: sin verificar</b> · Consulta «Historial / ATH».',
-             '', f'Holders (GMGN): {fmt(info.get("holder_count"))}',
-             f'Top 10 (GMGN): {fmt(stat.get("top_10_holder_rate"), ratio=True)}',
-             f'Carteras etiquetadas sniper (GMGN): {fmt(tags.get("sniper_wallets"))}']
+    price = fmt(pair.get('priceUsd'), money=True) if number(pair.get('priceUsd')) is not None else '—'
+    top = fmt(stat.get('top_10_holder_rate'), ratio=True) if number(stat.get('top_10_holder_rate')) is not None else '—'
+    lines = [f'<b>{esc(base.get("name", "Token"))} · ${esc(base.get("symbol", "?"), 25)}</b>',
+             f'Solana · {esc(pair.get("dexId", "DEX"))}',
+             f'💵 <b>{price}</b>', '',
+             f'MC <b>{compact(pair.get("marketCap"), True)}</b> · Liq <b>{compact((pair.get("liquidity") or {}).get("usd"), True)}</b>',
+             f'FDV {compact(pair.get("fdv"), True)} · Vol 24h {compact((pair.get("volume") or {}).get("h24"), True)}',
+             ' · '.join(f'{label} {change(changes.get(key))}' for key, label in [('m5', '5m'), ('h1', '1h'), ('h24', '24h')]),
+             f'Compras {compact(tx.get("buys"))} · Ventas {compact(tx.get("sells"))} <i>(24h)</i>', '',
+             '🏔 <b>ATH histórico: sin verificar</b>',
+             f'👥 Holders {compact(info.get("holder_count"))} · Top 10 {top}',
+             f'🎯 Snipers etiquetados {compact(tags.get("sniper_wallets"))}']
     if gmgn_note:
-        lines.append(esc(gmgn_note, 200))
+        lines.append('<i>GMGN: datos no disponibles</i>')
+    lines += ['', f'<code>{mint}</code>', '',
+              f'<i>DexScreener · Consulta {stamp(fetched)}</i>',
+              '<i>— Sin datos · Detalles en «Fuentes»</i>']
+    return '\n'.join(lines)
+
+
+def sources_text(pair, fetched, gmgn_note=''):
+    lines = ['<b>Fuentes y alcance</b>',
+             'Mercado: DexScreener. MC reportada por el proveedor; FDV es valoración diluida.',
+             'Precio, liquidez, variaciones, volumen y operaciones: par con mayor liquidez disponible. No representan todos los mercados.',
+             'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
+             'ATH histórico sin verificar: el botón ATH consulta el máximo del historial disponible, que puede ser incompleto.',
+             'Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
     created = number(pair.get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
         lines.append(f'Creación del par (no del token): {stamp(created / 1000)}')
-    lines += ['', f'<code>{mint}</code>',
-              f'Mercado: {esc(pair.get("dexId", "?"))} · par con mayor liquidez disponible en DexScreener.',
-              f'Fuente de mercado: DexScreener. Consultado: {stamp(fetched)}.',
-              'Hora de consulta, no garantía de frescura del proveedor. Chart: elige uno de los dos botones.']
-    return '\n'.join(lines)
+    if gmgn_note:
+        lines.append(esc(gmgn_note, 300))
+    lines += [f'Consulta de mercado: {stamp(fetched)}.',
+              'La hora de consulta no garantiza la frescura del proveedor. — significa dato no disponible, nunca cero.']
+    return '\n\n'.join(lines)
 
 
 def holders_text(data):
@@ -350,7 +383,7 @@ class Bot:
                 self.scanner.store.preference(user, arg)
                 return self.send(chat, 'Preferencia guardada para tus próximas consultas.')
             return
-        if action not in ('scan', 'ath', 'holders', 'snipers'):
+        if action not in ('scan', 'ath', 'holders', 'snipers', 'sources'):
             return self.send(chat, HELP)
         if time.monotonic() - self.last_request.get(user, -100) < 3:
             return self.send(chat, 'Espera unos segundos antes de la siguiente consulta.')
@@ -367,6 +400,14 @@ class Bot:
                     note = str(error)
                 return self.send(chat, card(arg, pair, fetched, info, note),
                                  keyboard(arg, pair['pairAddress'], self.scanner.store.preference(user)))
+            if action == 'sources':
+                pair, _, fetched = self.scanner.market(arg)
+                note = ''
+                try:
+                    self.scanner.gmgn_query('info', arg)
+                except DataError as error:
+                    note = str(error)
+                return self.send(chat, sources_text(pair, fetched, note))
             if action == 'ath':
                 return self.send(chat, self.scanner.history(arg))
             if action == 'holders':
