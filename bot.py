@@ -94,9 +94,8 @@ def esc(value, limit=100):
     return html.escape(str(value)[:limit])
 
 
-def fetch(url, payload=None, timeout=20, extra_headers=None):
+def fetch(url, payload=None, timeout=20):
     headers = {'User-Agent': 'VerazBot/0.1', 'Accept': 'application/json'}
-    headers.update(extra_headers or {})
     data = None
     if payload is not None:
         headers['Content-Type'] = 'application/json'
@@ -109,9 +108,7 @@ def fetch(url, payload=None, timeout=20, extra_headers=None):
         host = urllib.parse.urlsplit(url).hostname
         provider = {'api.geckoterminal.com': 'GeckoTerminal (historial)',
                     'api.dexscreener.com': 'DexScreener (mercado)',
-                    'api.telegram.org': 'Telegram',
-                    'api.gopluslabs.io': 'GoPlus', 'api.honeypot.is': 'Honeypot.is',
-                    'api.rugcheck.xyz': 'RugCheck'}.get(host, 'Proveedor')
+                    'api.telegram.org': 'Telegram'}.get(host, 'Proveedor')
         if host=='api.telegram.org' and error.code==400 and url.rsplit('/',1)[-1] in ('editMessageText','editMessageCaption'):
             try:
                 detail=json.loads(error.read(16384)).get('description','')
@@ -191,72 +188,29 @@ class Scanner:
         self.gmgn_blocked_until = 0
         self.chain = "solana"
 
-
-    def provider_security(self, source, chain, mint, force=False):
-        """Fixed read-only security endpoints. Missing results never mean 0% or safe."""
-        key=('security',source,chain,normalized(mint))
-        if not force and key in self.cache and time.time()-self.cache[key][0]<90:
-            return self.cache[key][1]
-        if not valid_contract(mint):
-            raise DataError('Contrato no válido para el escáner.')
-        address=urllib.parse.quote(mint, safe='')
-        chain_ids={'ethereum':1,'bsc':56,'base':8453,'arbitrum':42161,
-                   'polygon':137,'avalanche':43114,'optimism':10}
-        if source=='goplus':
-            if chain=='solana' and valid_address(mint):
-                url='https://api.gopluslabs.io/api/v1/solana/token_security?contract_addresses='+address
-            elif chain in chain_ids and re.fullmatch(r'0x[0-9a-fA-F]{40}',mint):
-                url=f'https://api.gopluslabs.io/api/v1/token_security/{chain_ids[chain]}?contract_addresses={address}'
-            else:
-                raise DataError('GoPlus sin cobertura confirmada para esta combinación red/contrato.')
-            key_value=os.environ.get('GOPLUS_ACCESS_TOKEN','').strip()
-            headers={'Authorization':'Bearer '+key_value} if key_value else None
-            data=(fetch(url,timeout=10,extra_headers=headers) if self.transport is fetch else self.transport(url))
-            if not isinstance(data,dict) or str(data.get('code'))!='1':
-                raise DataError('GoPlus no devolvió información de seguridad válida.')
-            result=data.get('result')
-            if not isinstance(result,dict):raise DataError('GoPlus devolvió un resultado vacío.')
-            # Never display data for a different token even if the response has one entry.
-            match=next((v for k,v in result.items() if same_token(k,mint) and isinstance(v,dict)),None)
-            if match is None:raise DataError('GoPlus no confirmó este contrato en la red.')
-        elif source=='honeypot':
-            if chain not in ('ethereum','bsc','base') or not re.fullmatch(r'0x[0-9a-fA-F]{40}',mint):
-                raise DataError('Honeypot.is no verifica esta red.')
-            cid={'ethereum':1,'bsc':56,'base':8453}[chain]
-            url=f'https://api.honeypot.is/v2/IsHoneypot?address={address}&chainID={cid}'
-            data=(fetch(url,timeout=10) if self.transport is fetch else self.transport(url))
-            if not isinstance(data,dict) or not isinstance(data.get('token'),dict) or not same_token(data['token'].get('address'),mint):
-                raise DataError('Honeypot.is no confirmó el contrato consultado.')
-            match=data
-        elif source=='rugcheck':
-            if chain!='solana' or not valid_address(mint):
-                raise DataError('RugCheck solo se consulta para tokens de Solana.')
-            url=f'https://api.rugcheck.xyz/v1/tokens/{address}/report/summary'
-            match=(fetch(url,timeout=10) if self.transport is fetch else self.transport(url))
-            if not isinstance(match,dict) or not any(k in match for k in ('risks','score','lpLockedPct','tokenProgram')):
-                raise DataError('RugCheck no devolvió un informe verificable.')
-        else:
-            raise DataError('Proveedor desconocido.')
-        self.cache[key]=(time.time(),match)
-        return match
-
-    def security_evidence(self,chain,mint,deep=False,force=False):
-        """Gather supported providers separately, preserving partial failures."""
-        sources={}
-        try:sources['GoPlus']=self.provider_security('goplus',chain,mint,force)
-        except DataError:pass
-        # The full scan consults a second independent service. On EVM cards,
-        # Honeypot.is is a TAX fallback when GoPlus omits either rate.
-        hp_chains=('ethereum','bsc','base')
-        missing_tax=(evm_rate((sources.get('GoPlus') or {}).get('buy_tax')) is None or
-                     evm_rate((sources.get('GoPlus') or {}).get('sell_tax')) is None)
-        if chain=='solana' and deep:
-            try:sources['RugCheck']=self.provider_security('rugcheck',chain,mint,force)
-            except DataError:pass
-        elif chain in hp_chains and (deep or missing_tax):
-            try:sources['Honeypot.is']=self.provider_security('honeypot',chain,mint,force)
-            except DataError:pass
-        return sources
+    def search_ticker(self,ticker):
+        ticker=ticker.lstrip('$').upper()
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]{0,19}',ticker):raise DataError('Ticker no válido.')
+        key=('ticker',ticker)
+        if key in self.cache and time.time()-self.cache[key][0]<30:return self.cache[key][1]
+        data=self.transport('https://api.dexscreener.com/latest/dex/search?q='+urllib.parse.quote(ticker,safe=''))
+        rows=data.get('pairs') if isinstance(data,dict) else None
+        if not isinstance(rows,list):raise DataError('No se pudo buscar el ticker. Prueba con el contrato.')
+        found={}
+        for row in rows:
+            if not isinstance(row,dict):continue
+            token=row.get('baseToken') or {}
+            chain=row.get('chainId')
+            if not isinstance(token,dict) or str(token.get('symbol','')).lstrip('$').upper()!=ticker:continue
+            address=token.get('address')
+            if not valid_contract(address) or not isinstance(chain,str) or not re.fullmatch(r'[a-z0-9-]{1,40}',chain):continue
+            identity=(chain,normalized(address))
+            liquidity=number((row.get('liquidity') or {}).get('usd')) or 0
+            if identity not in found or liquidity>found[identity]['liquidity']:
+                found[identity]={'chain':chain,'mint':normalized(address),'name':str(token.get('name') or ticker),'symbol':ticker,'liquidity':liquidity}
+        results=sorted(found.values(),key=lambda x:(-x['liquidity'],x['chain'],x['mint']))
+        self.cache[key]=(time.time(),results)
+        return results
 
     def dex_pairs(self, mint):
         key=('dex', normalized(mint))
@@ -461,189 +415,6 @@ class Scanner:
                 f'Consulta: {stamp(fetched)}')
 
 
-
-# Verified tax data is deliberately distinct from DEX pool fees and slippage.
-def known_flag(value):
-    if isinstance(value,dict):value=value.get('status')
-    if value in (True,1,'1'):return True
-    if value in (False,0,'0'):return False
-    return None
-
-
-def evm_rate(value):
-    """GoPlus EVM rates are fractions (1 == 100%); blank is unknown."""
-    n=number(value)
-    return n*100 if n is not None and 0<=n<=1 else None
-
-
-def percentage(n):
-    return ('{:.2f}'.format(n).rstrip('0').rstrip('.'))+'%' if n is not None else '—'
-
-
-def tax_details(chain, sources):
-    gp=sources.get('GoPlus') or {}
-    hp=sources.get('Honeypot.is') or {}
-    if chain=='solana':
-        transfer=gp.get('transfer_fee') if isinstance(gp.get('transfer_fee'),dict) else {}
-        current=transfer.get('current_fee_rate') if isinstance(transfer.get('current_fee_rate'),dict) else {}
-        basis=number(current.get('fee_rate'))
-        fee=basis/100 if basis is not None and 0<=basis<=10000 else None
-        scheduled=transfer.get('scheduled_fee_rate') if isinstance(transfer.get('scheduled_fee_rate'),dict) else {}
-        planned=number(scheduled.get('fee_rate'))
-        return {'buy':None,'sell':None,'transfer':fee,'source':'GoPlus' if fee is not None else None,
-                'scheduled':planned/100 if planned is not None and 0<=planned<=10000 else None}
-    buy,sell=evm_rate(gp.get('buy_tax')),evm_rate(gp.get('sell_tax'))
-    source='GoPlus' if buy is not None or sell is not None else None
-    sim=hp.get('simulationResult') if isinstance(hp.get('simulationResult'),dict) else {}
-    # Honeypot.is simulated values are already percentages, unlike GoPlus fractions.
-    def hp_rate(v):
-        n=number(v)
-        return n if n is not None and 0<=n<=100 else None
-    hb,hs=hp_rate(sim.get('buyTax')),hp_rate(sim.get('sellTax'))
-    mismatch=(buy is not None and hb is not None and abs(buy-hb)>=3) or (sell is not None and hs is not None and abs(sell-hs)>=3)
-    if buy is None:buy=hb
-    if sell is None:sell=hs
-    if source is None and (buy is not None or sell is not None):source='Honeypot.is'
-    return {'buy':buy,'sell':sell,'transfer':None,'source':source,'mismatch':mismatch,
-            'honeypot_buy':hb,'honeypot_sell':hs}
-
-
-def tax_line(chain,sources):
-    tax=tax_details(chain,sources)
-    if chain=='solana':
-        return '🧾 TAX C/V: — · Fee transferencia: '+percentage(tax['transfer'])
-    return '🧾 TAX C/V: '+percentage(tax['buy'])+' / '+percentage(tax['sell'])
-
-
-def security_assessment(chain,sources,market=None):
-    """Conservative heuristic, *not* a financial recommendation or an audit."""
-    flags=[]
-    evidence=0
-    critical=False
-    def mark(label,penalty=15,urgent=False):
-        nonlocal critical
-        if label not in [item[0] for item in flags]:flags.append((label,penalty))
-        critical=critical or urgent
-    gp=sources.get('GoPlus') or {}
-    hp=sources.get('Honeypot.is') or {}
-    rug=sources.get('RugCheck') or {}
-    if gp:
-        if chain=='solana':
-            checks=[('mintable','Puede emitir más tokens',22),('freezable','Puede congelar cuentas',28),
-                    ('closable','Autoridad para cerrar el programa',35),
-                    ('balance_mutable_authority','Puede modificar balances',50),
-                    ('transfer_fee_upgradable','Comisión modificable',26),
-                    ('default_account_state_upgradable','Restricciones de cuentas modificables',18),
-                    ('transfer_hook_upgradable','Hook de transferencia modificable',26)]
-            for key,label,penalty in checks:
-                val=known_flag(gp.get(key))
-                if val is not None:
-                    evidence+=1
-                    if val:mark(label,penalty,penalty>=35)
-            if known_flag(gp.get('non_transferable')) is not None:
-                evidence+=1
-                if known_flag(gp.get('non_transferable')):mark('Token no transferible',65,True)
-            state=str(gp.get('default_account_state',''))
-            if state in ('1','2'):
-                evidence+=1
-                if state=='2':mark('Cuentas congeladas por defecto',60,True)
-            hook=gp.get('transfer_hook')
-            if isinstance(hook,dict) and hook.get('address'):
-                evidence+=1
-                mark('Transferencias con programa externo',20)
-        else:
-            checks=[('is_honeypot','Honeypot detectado por GoPlus',80),
-                    ('cannot_buy','Restricciones para comprar',35),
-                    ('cannot_sell_all','No permite vender el 100%',40),
-                    ('is_mintable','Puede emitir más tokens',24),
-                    ('hidden_owner','Propietario oculto',30),
-                    ('owner_change_balance','Puede cambiar balances',60),
-                    ('transfer_pausable','Transferencias pausables',30),
-                    ('slippage_modifiable','TAX modificable',28),
-                    ('is_blacklisted','Posibilidad de lista negra',22),
-                    ('is_proxy','Contrato actualizable mediante proxy',15)]
-            for key,label,penalty in checks:
-                val=known_flag(gp.get(key))
-                if val is not None:
-                    evidence+=1
-                    if val:mark(label,penalty,penalty>=40)
-            if known_flag(gp.get('is_open_source')) is not None:
-                evidence+=1
-                if known_flag(gp.get('is_open_source')) is False:mark('Código fuente no verificado',28)
-    hp_state=(hp.get('honeypotResult') or {}) if isinstance(hp.get('honeypotResult'),dict) else {}
-    if known_flag(hp_state.get('isHoneypot')) is not None:
-        evidence+=1
-        if known_flag(hp_state['isHoneypot']):mark('Honeypot detectado por simulación',85,True)
-    risk_list=rug.get('risks') if isinstance(rug.get('risks'),list) else []
-    if rug:
-        evidence+=1
-        for risk in risk_list[:6]:
-            if not isinstance(risk,dict):continue
-            level=str(risk.get('level','')).lower()
-            if level not in ('danger','warn','warning','critical'):continue
-            p=32 if level in ('danger','critical') else 15
-            mark('RugCheck: '+str(risk.get('name') or 'riesgo detectado')[:65],p,level in ('danger','critical'))
-    tax=tax_details(chain,sources)
-    for side in ('buy','sell','transfer'):
-        v=tax.get(side)
-        if v is not None:
-            evidence+=1
-            if v>=40:mark('Comisión '+side+' extrema ('+percentage(v)+')',55,True)
-            elif v>=15:mark('Comisión '+side+' elevada ('+percentage(v)+')',30)
-            elif v>=7:mark('Comisión '+side+' significativa ('+percentage(v)+')',12)
-    if tax.get('mismatch'):
-        mark('TAX diferente entre GoPlus y Honeypot.is',22)
-    if market:
-        liquidity=number((market.get('liquidity') or {}).get('usd'))
-        if liquidity is not None:
-            evidence+=1
-            if liquidity<1000:mark('Liquidez extremadamente baja',60)
-            elif liquidity<5000:mark('Liquidez baja',20)
-    if not evidence:
-        return {'score':None,'verdict':'SIN DATOS SUFICIENTES','flags':[],'coverage':'insuficiente'}
-    score=max(0,100-sum(weight for _,weight in flags))
-    # Never award a full 100/100 when coverage is too weak to justify a score.
-    if not flags and (evidence<5 or len(sources)<2):score=None
-    # Never label a token low-risk on the strength of one source or few fields.
-    if critical:verdict='RIESGO CRÍTICO'
-    elif score is None:verdict='ANÁLISIS PARCIAL'
-    elif score<45:verdict='RIESGO ALTO'
-    elif score<75:verdict='PRECAUCIÓN'
-    elif evidence<5 or len(sources)<2:verdict='ANÁLISIS PARCIAL'
-    else:verdict='SIN ALERTAS CRÍTICAS DETECTADAS'
-    return {'score':score,'verdict':verdict,'flags':[name for name,_ in flags],
-            'coverage':'parcial' if evidence<5 or len(sources)<2 else 'múltiples fuentes'}
-
-
-def security_text(mint,chain,sources,market=None):
-    result=security_assessment(chain,sources,market)
-    tax=tax_details(chain,sources)
-    lines=['🔍 <b>MIGUELOTE SCAN · SEGURIDAD</b>',
-           f'Red: <b>{esc(chain.upper())}</b>',f'<code>{esc(mint,96)}</code>','',
-           '🛡 <b>Índice heurístico de seguridad</b>']
-    if result['score'] is None:
-        lines.append('Puntuación: — · '+result['verdict'])
-    else:
-        lines.append(f'Puntuación parcial: <b>{result["score"]}/100</b> · {result["verdict"]}')
-    lines += ['', '🧾 <b>Impuestos/comisiones del token</b>']
-    if chain=='solana':
-        lines.append('Compra / venta: — (no inferible con estas fuentes)')
-        lines.append('Token-2022 · comisión transferencia: <b>'+percentage(tax['transfer'])+'</b>')
-        if tax.get('scheduled') is not None:
-            lines.append('Próxima comisión configurada: '+percentage(tax['scheduled']))
-    else:
-        lines.append('TAX compra: <b>'+percentage(tax['buy'])+'</b>')
-        lines.append('TAX venta: <b>'+percentage(tax['sell'])+'</b>')
-        if tax.get('mismatch'):lines.append('⚠️ Los proveedores discrepan sobre el TAX.')
-    lines += ['', '🚩 <b>Alertas</b>']
-    lines += ['• '+esc(v,100) for v in result['flags'][:8]] if result['flags'] else ['Sin alertas reportadas en los datos consultados.']
-    providers='GoPlus · RugCheck' if chain=='solana' else ('GoPlus · Honeypot.is' if chain in ('ethereum','bsc','base') else 'GoPlus (si hay cobertura)')
-    lines += ['',f'Fuentes previstas: {providers}',
-              'Datos obtenidos: '+(', '.join(sources) if sources else 'ninguno'),
-              '<i>Consulta: '+stamp(time.time())+'</i>',
-              '<i>Escáner de riesgos, no auditoría ni consejo de inversión. Si faltan datos, NO implica seguridad.</i>']
-    return '\n'.join(lines)
-
 def keyboard(mint, pair, preference='dexscreener'):
     urls = {'dexscreener': f'https://dexscreener.com/solana/{pair}',
             'dextools': f'https://www.dextools.io/app/en/solana/pair-explorer/{pair}'}
@@ -657,7 +428,6 @@ def keyboard(mint, pair, preference='dexscreener'):
          {'text': '🏔 ATH', 'callback_data': f'ath:{mint}'}],
         [{'text': 'GMGN', 'url': f'https://gmgn.ai/sol/token/{mint}'},
          {'text': 'Solscan', 'url': f'https://solscan.io/token/{mint}'}],
-        [{'text': '🔍 SCAN Seguridad', 'callback_data': f'security:{mint}'}],
         [{'text': '🔄 Actualizar', 'callback_data': f'scan:{mint}'},
          {'text': 'ℹ Fuentes', 'callback_data': f'sources:{mint}'}],
         [{'text': '⚙ Elegir gráfico', 'callback_data': 'settings'}]
@@ -786,7 +556,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     if isinstance(username,str) and re.fullmatch(r'@?[A-Za-z0-9_]{1,15}',username):
         links.append(safe_link('X','https://x.com/'+username.lstrip('@')))
     if links: lines += ['', '🔗 <b>Socials</b>', ' · '.join(links)]
-    lines += ['', tax_line(chain,pair.get('security_sources') or {}), '', '👥 <b>Distribución</b>',
+    lines += ['', '👥 <b>Distribución</b>',
               f'├ Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
               '├ '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
               '├ '+pair.get('bundler_text','Bundled —').replace('🎯 ',''),
@@ -836,12 +606,11 @@ def holders_text(data, chain='solana'):
 
 
 HELP = ('<b>Miguelote Scan · Multired</b>\n'
-        'Pega un contrato o utiliza /scan RED:CONTRATO. Ejemplo: base:0x…\n'
+        'Pega un contrato, escribe $CHOP o utiliza /scan RED:CONTRATO. Ejemplo: base:0x…\n'
         '/chart — elegir DexScreener o DEXTools\n'
         '/holders CONTRATO — top holders GMGN\n'
         '/snipers CONTRATO — detección GMGN\n'
-        '/ath CONTRATO — máximo del historial disponible\n'
-        '🔍 SCAN Seguridad — revisa TAX, permisos y riesgos de los proveedores compatibles\n\n'
+        '/ath CONTRATO — máximo del historial disponible\n\n'
         'Los charts se abren en el navegador. Bubble Maps depende de cobertura externa. '
         'Datos: GMGN. ATH de precio reportado por el proveedor; no certificado independientemente.')
 
@@ -955,8 +724,32 @@ class Bot:
                 candidates = re.findall(r'(?<![A-Za-z0-9])(?:0x[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?|[1-9A-HJ-NP-Za-km-z]{32,44})(?![A-Za-z0-9])', text)
                 arg = next((x for x in candidates if valid_contract(x)), '')
                 if not arg:
-                    return
+                    tickers=re.findall(r'(?<![A-Za-z0-9_])\$([A-Za-z][A-Za-z0-9_]{0,19})(?![A-Za-z0-9_])',text)
+                    if not tickers:return
+                    if len(set(t.upper() for t in tickers))>1:
+                        return self.send(chat,'Envía un solo ticker por consulta, por ejemplo $CHOP.')
+                    arg='$'+tickers[0]
                 action = 'scan'
+        if action=='scan' and re.fullmatch(r'\$[A-Za-z][A-Za-z0-9_]{0,19}',arg):
+            if time.monotonic()-max(self.last_request.get(user,-100),self.last_request.get(('ticker',user),-100))<3:
+                return self.send(chat,'Espera unos segundos antes de la siguiente consulta.')
+            try:matches=self.scanner.search_ticker(arg)
+            except DataError as error:return self.send(chat,esc(str(error),200))
+            if len(matches)==1:
+                arg=matches[0]['chain']+':'+matches[0]['mint']
+            else:
+                self.last_request[('ticker',user)]=time.monotonic()
+                if not matches:return self.send(chat,'No encuentro ese ticker exacto. Envía el contrato para consultarlo.')
+                rows=[]
+                for result in matches[:30]:
+                    address=result['mint']
+                    direct='scan:'+result['chain']+':'+address
+                    if len(direct.encode())>64:
+                        ref=self.scanner.store.reference({'chat':chat,'chain':result['chain'],'mint':address})
+                        direct='scan:ref_'+ref
+                    label=result['name'][:22]+' · '+result['chain'].title()+' · '+address[:5]+'…'+address[-5:]
+                    rows.append([{'text':label,'callback_data':direct}])
+                return self.send(chat,'🔎 <b>¿Qué '+esc(arg.upper())+' quieres consultar?</b>\nElige por nombre, red y contrato. Resultados indexados; si no aparece, pega el contrato.',{'inline_keyboard':rows})
         explicit_refresh=bool(callback and action=='refresh')
         if explicit_refresh:action='scan'
         refreshing=explicit_refresh or bool(callback and action=='scan' and any(
@@ -976,20 +769,20 @@ class Bot:
                 self.scanner.store.preference(user, arg)
                 return self.send(chat, 'Preferencia guardada para tus próximas consultas.')
             return
-        if action not in ('scan', 'ath', 'holders', 'snipers', 'sources', 'security', 'srefresh'):
+        if action not in ('scan', 'ath', 'holders', 'snipers', 'sources'):
             return self.send(chat, HELP)
         chain = None
         if arg.startswith('ref_'):
             ref=self.scanner.store.reference(key=arg[4:])
-            if not ref and (refreshing or action in ('security','srefresh')):
+            if not ref and refreshing:
                 # Old buttons refer to local state, which Render may discard on restart.
                 body=msg.get('text') or msg.get('caption') or ''
                 addresses=[line.strip() for line in body.splitlines() if valid_contract(line.strip())]
-                network=re.search(r'^([A-Za-z0-9-]+) ·',body,re.M) or re.search(r'^Red:\s*([A-Za-z0-9-]+)',body,re.M)
+                network=re.search(r'^([A-Za-z0-9-]+) ·',body,re.M)
                 if len(addresses)==1 and network:
                     ref={'chat':chat,'chain':network.group(1).lower(),'mint':addresses[0]}
             if not ref or ref.get('chat') != chat:
-                if refreshing or action=='srefresh':return self.callback_notice(callback,'Esta ficha ha caducado. Envía de nuevo el contrato.')
+                if refreshing:return self.callback_notice(callback,'Esta ficha ha caducado. Envía de nuevo el contrato.')
                 return self.send(chat,'Esta ficha ha caducado. Envía de nuevo el contrato.')
             chain,arg=ref['chain'],ref['mint']
         elif ':' in arg:
@@ -1030,7 +823,6 @@ class Bot:
                 pair, _, fetched = self.scanner.refresh_market(arg)
                 pair = self.scanner.enrich_activity(arg,pair)
                 info = pair['gmgn_info']
-                pair['security_sources']=self.scanner.security_evidence(chain,arg,force=refreshing)
                 try:
                     pair['sniper_text'] = self.scanner.current_snipers(arg)
                 except DataError:
@@ -1043,22 +835,6 @@ class Bot:
                     return self.edit_card(msg,card(arg,pair,fetched,info),self.network_keyboard(chat,arg,pair,user))
                 return self.send_card(chat, card(arg, pair, fetched, info),
                                       self.network_keyboard(chat,arg,pair,user), self.scanner.images(arg,info))
-            if action in ('security','srefresh'):
-                sources=self.scanner.security_evidence(chain,arg,deep=True,force=action=='srefresh')
-                try:
-                    pair,_,_=self.scanner.market(arg)
-                except DataError:
-                    pair=None
-                report=security_text(arg,chain,sources,pair)
-                ref=self.scanner.store.reference({'chat':chat,'mint':arg,'chain':chain})
-                markup={'inline_keyboard':[[{'text':'🔄 Reescanear','callback_data':'srefresh:ref_'+ref}],
-                                          [{'text':'Quick Intel (web)','url':'https://app.quickintel.io/scanner'}]]}
-                if chain=='solana':
-                    markup['inline_keyboard'].append([{'text':'RugCheck (web)',
-                      'url':'https://rugcheck.xyz/tokens/'+urllib.parse.quote(arg,safe='')}])
-                if action=='srefresh':
-                    return self.edit_card(msg,report,markup)
-                return self.send(chat,report,markup)
             if action == 'sources':
                 pair, _, fetched = self.scanner.market(arg)
                 note = ''
