@@ -248,7 +248,9 @@ class Scanner:
         return list(dict.fromkeys(u for u in urls if isinstance(u,str) and u.startswith('https://') and len(u)<2048))[:3]
 
     def refresh_market(self,mint):
-        self.cache.pop(('gmgn',self.chain,'info',normalized(mint)),None)
+        for key in list(self.cache):
+            if len(key)>=3 and key[0] in ('gmgn','aser') and key[-1]==normalized(mint):
+                self.cache.pop(key,None)
         self.cache.pop(('dex',normalized(mint)),None)
         return self.market(mint)
 
@@ -537,7 +539,8 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
               f'└ Equipo: {ratio(stat.get("dev_team_hold_rate"))}',
               '', f'P: <code>{short(pair.get("pairAddress"))}</code>',
               f'DEV: <code>{short(dev.get("creator_address"))}</code>',
-              '',f'<code>{mint}</code>']
+              '',f'<code>{mint}</code>',
+              '<i>🔄 Última consulta: '+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</i>']
     return '\n'.join(lines)
 
 
@@ -650,7 +653,9 @@ class Bot:
         for row in markup['inline_keyboard']:
             for button in row:
                 if ':' in button.get('callback_data',''):
-                    button['callback_data']=button['callback_data'].split(':')[0]+':'+data
+                    verb=button['callback_data'].split(':')[0]
+                    direct='refresh:'+chain+':'+mint
+                    button['callback_data']=direct if verb=='scan' and len(direct.encode())<=64 else verb+':'+data
         if chain=='solana':
             return markup
         q=urllib.parse.quote
@@ -681,7 +686,8 @@ class Bot:
             return
         user = ((callback or msg).get('from') or {}).get('id', chat)
         if callback:
-            self.api('answerCallbackQuery', {'callback_query_id': callback['id']})
+            try:self.api('answerCallbackQuery', {'callback_query_id': callback['id']})
+            except DataError:pass
             action, _, arg = callback.get('data', '').partition(':')
         else:
             text = (msg.get('text') or msg.get('caption') or '').strip()
@@ -696,7 +702,9 @@ class Bot:
                 if not arg:
                     return
                 action = 'scan'
-        refreshing=bool(callback and action=='scan' and any(
+        explicit_refresh=bool(callback and action=='refresh')
+        if explicit_refresh:action='scan'
+        refreshing=explicit_refresh or bool(callback and action=='scan' and any(
             'Actualizar' in b.get('text','')
             for row in (msg.get('reply_markup') or {}).get('inline_keyboard',[]) for b in row))
         if action == 'missingpool':
@@ -718,6 +726,13 @@ class Bot:
         chain = None
         if arg.startswith('ref_'):
             ref=self.scanner.store.reference(key=arg[4:])
+            if not ref and refreshing:
+                # Old buttons refer to local state, which Render may discard on restart.
+                body=msg.get('text') or msg.get('caption') or ''
+                addresses=[line.strip() for line in body.splitlines() if valid_contract(line.strip())]
+                network=re.search(r'^([A-Za-z0-9-]+) ·',body,re.M)
+                if len(addresses)==1 and network:
+                    ref={'chat':chat,'chain':network.group(1).lower(),'mint':addresses[0]}
             if not ref or ref.get('chat') != chat:
                 if refreshing:return self.callback_notice(callback,'Esta ficha ha caducado. Envía de nuevo el contrato.')
                 return self.send(chat,'Esta ficha ha caducado. Envía de nuevo el contrato.')
@@ -789,7 +804,7 @@ class Bot:
                                  '\nParticipación actual del suministro en carteras etiquetadas. GMGN: hasta 100 carteras; Aser: solo lecturas completas y recientes. No mide las compras al lanzamiento.\n' +
                                  f'Consulta/caché de hasta 60 s · {stamp(time.time())}')
         except DataError as error:
-            if refreshing:return self.callback_notice(callback,'No se pudo actualizar. Se conserva la ficha anterior. Inténtalo de nuevo.')
+            if refreshing:return self.callback_notice(callback,'No se pudo actualizar: '+str(error))
             return self.send(chat, esc(str(error), 500))
 
     def run(self):
