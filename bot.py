@@ -129,6 +129,22 @@ class Store:
         self.db.execute('CREATE TABLE IF NOT EXISTS snapshots (mint TEXT, fetched REAL, pair TEXT, payload TEXT)')
         self.db.execute('CREATE INDEX IF NOT EXISTS by_mint ON snapshots(mint,fetched)')
         self.db.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS calls (chat INTEGER, mint TEXT, author TEXT, message_id INTEGER, called_at REAL, price REAL, quoted_at REAL, PRIMARY KEY(chat,mint))')
+
+    def first_call(self, chat, mint, author=None, message_id=None, called_at=None):
+        if author is not None:
+            self.db.execute('INSERT OR IGNORE INTO calls(chat,mint,author,message_id,called_at) VALUES (?,?,?,?,?)',
+                            (chat, mint, author, message_id, called_at))
+            self.db.commit()
+        return self.db.execute('SELECT author,message_id,called_at,price,quoted_at FROM calls WHERE chat=? AND mint=?', (chat,mint)).fetchone()
+
+    def quote_call(self, chat, mint, message_id, price, quoted_at):
+        price = number(price)
+        if price is not None and price > 0:
+            self.db.execute('UPDATE calls SET price=?,quoted_at=? WHERE chat=? AND mint=? AND message_id=? AND price IS NULL',
+                            (price,quoted_at,chat,mint,message_id))
+            self.db.commit()
+
 
     def preference(self, user, provider=None):
         if provider is not None:
@@ -195,7 +211,9 @@ class Scanner:
         key = ('gmgn', command, mint)
         if key in self.cache and time.time() - self.cache[key][0] < 60:
             return self.cache[key][1]
-        args = ['gmgn-cli', 'token', command, '--chain', 'sol', '--address', mint, '--raw']
+        args = ['gmgn-cli', 'token', 'holders' if command == 'sniper_holders' else command, '--chain', 'sol', '--address', mint, '--raw']
+        if command == 'sniper_holders':
+            args += ['--tag', 'sniper', '--limit', '100', '--order-by', 'amount_percentage', '--direction', 'desc']
         if command == 'holders':
             args += ['--limit', '10', '--order-by', 'amount_percentage', '--direction', 'desc']
         try:
@@ -218,6 +236,25 @@ class Scanner:
         self.cache[key] = (time.time(), data)
         return data
 
+    def current_snipers(self, mint):
+        data = self.gmgn_query('sniper_holders', mint)
+        rows = data.get('list')
+        if not isinstance(rows, list):
+            raise DataError('GMGN no devolvió la lista de snipers actuales.')
+        seen, total = set(), 0.0
+        for row in rows:
+            if not isinstance(row, dict) or not valid_address(row.get('address')):
+                raise DataError('Lista sniper incompleta o no válida.')
+            ratio = number(row.get('amount_percentage'))
+            if ratio is None or not 0 <= ratio <= 1 or row['address'] in seen:
+                raise DataError('Porcentajes sniper no válidos; no se calcula un total.')
+            seen.add(row['address'])
+            total += ratio
+        if total > 1.000001:
+            raise DataError('Porcentajes sniper inconsistentes.')
+        label = 'Snipers actuales (parcial, 100 carteras)' if len(rows) >= 100 else 'Snipers actuales (GMGN)'
+        return f'🎯 {label}: {fmt(total, ratio=True)} del suministro'
+
     def history(self, mint):
         pair, _, fetched = self.market(mint)
         info = pair['gmgn_info']
@@ -230,7 +267,8 @@ class Scanner:
             return '<b>ATH de precio · GMGN</b>\nDato inconsistente: inferior al precio actual. ATH sin verificar.'
         return (f'<b>ATH de precio reportado por GMGN</b>\n{fmt(ath, money=True)}\n\n'
                 'Fecha del ATH: no disponible en este campo.\n'
-                'ATH de capitalización: no disponible.\n'
+                f'{ath_mc(info)}\n'
+                '*Si aparece ≈: estimación con suministro actual; MC histórico sin verificar.\n'
                 'Dato del proveedor, sin contraste independiente de todo el historial.\n'
                 f'Consulta: {stamp(fetched)}')
 
@@ -238,19 +276,19 @@ class Scanner:
 def keyboard(mint, pair, preference='dexscreener'):
     urls = {'dexscreener': f'https://dexscreener.com/solana/{pair}',
             'dextools': f'https://www.dextools.io/app/en/solana/pair-explorer/{pair}'}
-    labels = {'dexscreener': '📊 DexScreener', 'dextools': '📈 DEXTools'}
+    labels = {'dexscreener': 'DexScreener', 'dextools': 'DEXTools'}
     order = [preference, 'dextools' if preference == 'dexscreener' else 'dexscreener']
     return {'inline_keyboard': [
         [({'text': labels[k] + (' ★' if k == preference else ''), 'url': urls[k]} if valid_address(pair) else {'text': labels[k], 'callback_data': 'missingpool'}) for k in order],
-        [{'text': '🫧 Bubble Maps', 'url': f'https://app.bubblemaps.io/sol/token/{mint}'},
-         {'text': '👥 Top holders', 'callback_data': f'holders:{mint}'}],
+        [{'text': '🫧 Mapa', 'url': f'https://app.bubblemaps.io/sol/token/{mint}'},
+         {'text': '👥 Holders', 'callback_data': f'holders:{mint}'}],
         [{'text': '🎯 Snipers', 'callback_data': f'snipers:{mint}'},
-         {'text': '🏔 Historial / ATH', 'callback_data': f'ath:{mint}'}],
+         {'text': '🏔 ATH', 'callback_data': f'ath:{mint}'}],
         [{'text': 'GMGN', 'url': f'https://gmgn.ai/sol/token/{mint}'},
          {'text': 'Solscan', 'url': f'https://solscan.io/token/{mint}'}],
         [{'text': '🔄 Actualizar', 'callback_data': f'scan:{mint}'},
-         {'text': 'ℹ Fuentes', 'callback_data': f'sources:{mint}'},
-         {'text': '⚙ Chart', 'callback_data': 'settings'}]
+         {'text': 'ℹ Fuentes', 'callback_data': f'sources:{mint}'}],
+        [{'text': '⚙ Elegir gráfico', 'callback_data': 'settings'}]
     ]}
 
 
@@ -272,13 +310,29 @@ def change(value):
     return ('🟢 +' if n > 0 else '🔴 ' if n < 0 else '') + f'{n:.2f}'.rstrip('0').rstrip('.') + '%'
 
 
+def ath_mc(info):
+    ath, supply = number(info.get('ath_price')), number(info.get('circulating_supply'))
+    if ath is None or ath <= 0 or supply is None or supply < 0:
+        return 'MC al precio ATH: — (sin suministro histórico)'
+    return f'MC al precio ATH ≈ {compact(ath * supply, True)}*'
+
+
+def call_text(record, current):
+    if not record:
+        return ''
+    author, message_id, when, initial, quoted_at = record
+    current = number(current)
+    variation = change((current / initial - 1) * 100) if initial and current is not None else '— (sin precio inicial)'
+    return f'📣 Primera call registrada: <b>{esc(author, 70)}</b>\nDesde su call: <b>{variation}</b>\n<i>{stamp(when)}</i>'
+
+
 def ath_line(info, current):
     ath, current = number(info.get('ath_price')), number(current)
     if ath is None or ath <= 0:
         return '🏔 <b>ATH de precio: no disponible</b>'
     if current is not None and ath < current:
         return '🏔 <b>ATH de precio: dato inconsistente</b>'
-    return f'🏔 <b>ATH precio {fmt(ath, money=True)}</b> · GMGN'
+    return f'🏔 <b>ATH precio {fmt(ath, money=True)}</b> · {ath_mc(info)}'
 
 
 def card(mint, pair, fetched, info=None, gmgn_note=''):
@@ -298,9 +352,13 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
              f'Compras {compact(tx.get("buys"))} · Ventas {compact(tx.get("sells"))} <i>(24h)</i>', '',
              ath_line(info, pair.get('priceUsd')),
              f'👥 Holders {compact(info.get("holder_count"))} · Top 10 {top}',
-             f'🎯 Snipers etiquetados {compact(tags.get("sniper_wallets"))}']
+             pair.get('sniper_text', '🎯 Snipers actuales: —')]
     if gmgn_note:
         lines.append('<i>GMGN: datos no disponibles</i>')
+    if pair.get('call_text'):
+        lines += ['', pair['call_text']]
+    if '≈' in ath_mc(info):
+        lines.append('<i>*Estimación con suministro circulante actual; MC histórico sin verificar.</i>')
     lines += ['', f'<code>{mint}</code>', '',
               f'<i>GMGN · Consulta {stamp(fetched)}</i>',
               '<i>— Sin datos · Detalles en «Fuentes»</i>']
@@ -312,7 +370,7 @@ def sources_text(pair, fetched, gmgn_note=''):
              'Mercado: GMGN. MC = precio × suministro circulante. FDV = precio × suministro total; no se sustituye MC por FDV.',
              'Precio y actividad: GMGN. Variaciones calculadas con sus precios al inicio de cada período. Liquidez del pool principal indicado por GMGN.',
              'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
-             'ATH de precio: campo ath_price de GMGN, sin verificación independiente. No equivale al ATH de capitalización. Si falta, se indica como no disponible.',
+             'ATH de precio: reportado por GMGN. MC al precio ATH marcado ≈ es una estimación con suministro circulante actual, no el MC histórico. Snipers: suma de participaciones de holders etiquetados por GMGN, consulta limitada a 100 carteras; una lista de 100 es parcial. Calls: primer contrato recibido por el bot en cada grupo; precio de referencia de la primera consulta, no precio exacto del mensaje. La variación se actualiza al consultar, sin alertas automáticas.',
              'Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
     created = number(pair.get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
@@ -372,6 +430,20 @@ class Bot:
             payload['reply_markup'] = markup
         return self.api('sendMessage', payload)
 
+    def send_card(self, chat, text, markup, logo):
+        if isinstance(logo, str) and logo.startswith('https://') and len(logo) < 2048:
+            payload = {'chat_id': chat, 'photo': logo}
+            fits = len(text.encode('utf-16-le')) // 2 <= 1024
+            if fits:
+                payload.update(caption=text, parse_mode='HTML', reply_markup=markup)
+            try:
+                result = self.api('sendPhoto', payload)
+                if fits:
+                    return result
+            except DataError:
+                text += '\n<i>Imagen no disponible.</i>'
+        return self.send(chat, text, markup)
+
     def settings(self, chat):
         self.send(chat, 'Elige tu gráfico preferido. Siempre tendrás disponibles los dos botones.',
                   {'inline_keyboard': [[{'text': 'DexScreener', 'callback_data': 'pref:dexscreener'},
@@ -390,14 +462,18 @@ class Bot:
             self.api('answerCallbackQuery', {'callback_query_id': callback['id']})
             action, _, arg = callback.get('data', '').partition(':')
         else:
-            text = (msg.get('text') or '').strip()
+            text = (msg.get('text') or msg.get('caption') or '').strip()
             if text.startswith('/'):
                 first, _, arg = text.partition(' ')
                 action = first.split('@')[0][1:].lower()
             elif valid_address(text):
                 action, arg = 'scan', text
             else:
-                return
+                candidates = re.findall(r'(?<![A-Za-z0-9])[1-9A-HJ-NP-Za-km-z]{32,44}(?![A-Za-z0-9])', text)
+                arg = next((x for x in candidates if valid_address(x)), '')
+                if not arg:
+                    return
+                action = 'scan'
         if action == 'missingpool':
             return self.send(chat, 'GMGN no ha devuelto un pool válido para abrir este gráfico. Puedes usar el botón GMGN.')
         if action in ('start', 'help'):
@@ -414,6 +490,11 @@ class Bot:
             return
         if action not in ('scan', 'ath', 'holders', 'snipers', 'sources'):
             return self.send(chat, HELP)
+        group_call = not callback and action == 'scan' and msg['chat'].get('type') in ('group', 'supergroup') and valid_address(arg)
+        if group_call:
+            sender = msg.get('sender_chat') or msg.get('from') or {}
+            author = ('@' + sender['username']) if sender.get('username') else sender.get('title') or sender.get('first_name') or 'Autor no identificado'
+            self.scanner.store.first_call(chat, arg, author, msg.get('message_id'), msg.get('date', time.time()))
         if time.monotonic() - self.last_request.get(user, -100) < 3:
             return self.send(chat, 'Espera unos segundos antes de la siguiente consulta.')
         self.last_request[user] = time.monotonic()
@@ -422,13 +503,16 @@ class Bot:
                 raise DataError('Pega el contrato completo de Solana después del comando.')
             if action == 'scan':
                 pair, _, fetched = self.scanner.market(arg)
-                info, note = None, ''
+                info = pair['gmgn_info']
+                if group_call:
+                    self.scanner.store.quote_call(chat, arg, msg.get('message_id'), pair.get('priceUsd'), fetched)
                 try:
-                    info = self.scanner.gmgn_query('info', arg)
-                except DataError as error:
-                    note = str(error)
-                return self.send(chat, card(arg, pair, fetched, info, note),
-                                 keyboard(arg, pair['pairAddress'], self.scanner.store.preference(user)))
+                    pair['sniper_text'] = self.scanner.current_snipers(arg)
+                except DataError:
+                    pair['sniper_text'] = '🎯 Snipers actuales: — (consulta no disponible)'
+                pair['call_text'] = call_text(self.scanner.store.first_call(chat, arg), pair.get('priceUsd'))
+                return self.send_card(chat, card(arg, pair, fetched, info),
+                                      keyboard(arg, pair['pairAddress'], self.scanner.store.preference(user)), info.get('logo'))
             if action == 'sources':
                 pair, _, fetched = self.scanner.market(arg)
                 note = ''
@@ -442,11 +526,8 @@ class Bot:
             if action == 'holders':
                 return self.send(chat, holders_text(self.scanner.gmgn_query('holders', arg)))
             if action == 'snipers':
-                data = self.scanner.gmgn_query('security', arg)
-                return self.send(chat, '<b>Snipers de lanzamiento · GMGN</b>\n'
-                                 f'Carteras detectadas: {fmt(data.get("sniper_count"))}\n'
-                                 'Clasificación de GMGN; no prueba que todas sean bots ni que conserven tokens.\n'
-                                 'Porcentaje que conservan: no calculado en esta versión.\n'
+                return self.send(chat, self.scanner.current_snipers(arg) +
+                                 '\nParticipación actual de las carteras etiquetadas por GMGN; no porcentaje de compras al lanzamiento. Consulta limitada a 100 carteras.\n' +
                                  f'Consulta/caché de hasta 60 s · {stamp(time.time())}')
         except DataError as error:
             return self.send(chat, esc(str(error), 500))
