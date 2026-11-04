@@ -271,9 +271,9 @@ class Scanner:
             raise DataError('GMGN en pausa por límite de consultas; vuelve a intentarlo más tarde.')
         if not shutil.which('gmgn-cli'):
             raise DataError('Falta instalar gmgn-cli en el equipo del bot.')
-        args = ['gmgn-cli', 'token', 'holders' if command == 'sniper_holders' else command, '--chain', GMGN_CHAINS[self.chain], '--address', mint, '--raw']
-        if command == 'sniper_holders':
-            args += ['--tag', 'sniper', '--limit', '100', '--order-by', 'amount_percentage', '--direction', 'desc']
+        args = ['gmgn-cli', 'token', 'holders' if command in ('sniper_holders','bundler_holders') else command, '--chain', GMGN_CHAINS[self.chain], '--address', mint, '--raw']
+        if command in ('sniper_holders','bundler_holders'):
+            args += ['--tag', 'sniper' if command=='sniper_holders' else 'bundler', '--limit', '100', '--order-by', 'amount_percentage', '--direction', 'desc']
         if command == 'holders':
             args += ['--limit', '10', '--order-by', 'amount_percentage', '--direction', 'desc']
         delay = 1.1 - (time.monotonic() - self.cache.get(('gmgn_last',), 0))
@@ -301,7 +301,12 @@ class Scanner:
         return data
 
     def current_snipers(self, mint):
-        data = self.gmgn_query('sniper_holders', mint)
+        return self.current_tag_holdings(mint,'sniper')
+
+    def current_tag_holdings(self, mint, tag):
+        if tag not in ('sniper','bundler'):
+            raise DataError('Etiqueta no válida.')
+        data = self.gmgn_query(tag+'_holders', mint)
         rows = data.get('list')
         if not isinstance(rows, list):
             raise DataError('GMGN no devolvió la lista de snipers actuales.')
@@ -316,7 +321,8 @@ class Scanner:
             total += ratio
         if total > 1.000001:
             raise DataError('Porcentajes sniper inconsistentes.')
-        label = 'Snipers (parcial)' if len(rows) >= 100 else 'Snipers'
+        label = 'Snipers' if tag=='sniper' else 'Bundled'
+        if len(rows)>=100: label += ' (parcial)'
         return f'🎯 {label}: {fmt(total, ratio=True)}'
 
     def history(self, mint):
@@ -399,28 +405,77 @@ def ath_line(info, current):
     return f'🏔 <b>ATH {fmt(ath, money=True)}</b> · {ath_mc(info)}'
 
 
-def card(mint, pair, fetched, info=None, gmgn_note=''):
-    base = pair.get('baseToken') or {}
-    changes = pair.get('priceChange') or {}
-    tx = (pair.get('txns') or {}).get('h24') or {}
-    info = info or pair.get('gmgn_info') or {}
-    stat, tags = info.get('stat') or {}, info.get('wallet_tags_stat') or {}
-    price = fmt(pair.get('priceUsd'), money=True) if number(pair.get('priceUsd')) is not None else '—'
-    top = fmt(stat.get('top_10_holder_rate'), ratio=True) if number(stat.get('top_10_holder_rate')) is not None else '—'
-    lines = [f'<b>{esc(base.get("name", "Token"))} · ${esc(base.get("symbol", "?"), 25)}</b>',
-             f'{esc(pair.get("chainId", "solana").title())} · {esc(pair.get("dexId", "DEX"))}',
-             f'💵 <b>{price}</b>', '',
-             f'MC <b>{compact(pair.get("marketCap"), True)}</b> · Liq <b>{compact((pair.get("liquidity") or {}).get("usd"), True)}</b>',
-             f'FDV {compact(pair.get("fdv"), True)} · Vol 24h {compact((pair.get("volume") or {}).get("h24"), True)}',
-             ' · '.join(f'{label} {change(changes.get(key))}' for key, label in [('m5', '5m'), ('h1', '1h'), ('h24', '24h')]),
-             f'Compras {compact(tx.get("buys"))} · Ventas {compact(tx.get("sells"))} <i>(24h)</i>', '',
-             ath_line(info, pair.get('priceUsd')),
-             f'👥 Holders {compact(info.get("holder_count"))} · Top 10 {top}',
-             pair.get('sniper_text', '🎯 Snipers actuales: —')]
+def safe_link(label, url):
+    if not isinstance(url,str) or len(url)>2048:
+        return None
+    parsed=urllib.parse.urlsplit(url)
+    if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username:
+        return None
+    return f'<a href="{html.escape(url,quote=True)}">{esc(label)}</a>'
 
+
+def age_text(timestamp, now):
+    value=number(timestamp)
+    if value is None or value<=0 or value>now:
+        return '—'
+    seconds=now-value
+    if seconds>=86400: return str(int(seconds//86400))+'d'
+    if seconds>=3600: return str(int(seconds//3600))+'h'
+    return str(int(seconds//60))+'m'
+
+
+def card(mint, pair, fetched, info=None, gmgn_note=''):
+    base=pair.get('baseToken') or {}
+    info=info or pair.get('gmgn_info') or {}
+    stat=info.get('stat') or {}
+    dev=info.get('dev') or {}
+    changes=pair.get('priceChange') or {}
+    tx=(pair.get('txns') or {}).get('h24') or {}
+    current=number(pair.get('priceUsd'))
+    ath=number(info.get('ath_price'))
+    chain=pair.get('chainId','solana')
+    ratio=lambda v:fmt(v,ratio=True) if number(v) is not None and 0<=number(v)<=1 else '—'
+    short=lambda v: (v[:6]+'…'+v[-4:]) if valid_contract(v) else '—'
+    age=age_text(info.get('creation_timestamp'),fetched)
+    name=esc(base.get('name','Token'),45)
+    symbol=esc(base.get('symbol','?'),18)
+    lines=[f'<b>{name} (${symbol})</b>',
+           f'{esc(chain.title())} · {esc(pair.get("dexId","DEX"),25)} · 🌱 {age}', '',
+           '📊 <b>Token Stats</b>',
+           f'├ MC: <b>{compact(pair.get("marketCap"),True)}</b>',
+           f'├ USD: <b>{fmt(current,money=True) if current is not None else "—"}</b>',
+           f'├ LIQ: <b>{compact((pair.get("liquidity") or {}).get("usd"),True)}</b>',
+           f'├ VOL: <b>{compact((pair.get("volume") or {}).get("h24"),True)}</b> (24h)',
+           f'├ 5m: {change(changes.get("m5"))} · 1h: {change(changes.get("h1"))}',
+           f'├ 24h: {change(changes.get("h24"))}',
+           f'├ B/S: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24h)',
+           f'└ HLD: <b>{compact(info.get("holder_count"))}</b>', '',
+           '🏔 <b>ATH</b>']
+    if ath is not None and ath>0 and (current is None or current<=ath):
+        lines += [f'├ Precio: <b>{fmt(ath,money=True)}</b>',f'├ {ath_mc(info)}']
+        drop=(current/ath-1)*100 if current is not None else None
+        lines += [f'└ Desde ATH: {change(drop)}']
+    else:
+        lines += ['└ —']
+    social=info.get('link') or {}
+    links=[]
+    for label,key in [('Web','website'),('TG','telegram'),('Discord','discord')]:
+        link=safe_link(label,social.get(key))
+        if link:links.append(link)
+    username=social.get('twitter_username')
+    if isinstance(username,str) and re.fullmatch(r'@?[A-Za-z0-9_]{1,15}',username):
+        links.append(safe_link('X','https://x.com/'+username.lstrip('@')))
+    if links: lines += ['', '🔗 <b>Socials</b>', ' · '.join(links)]
+    lines += ['', '👥 <b>Distribución</b>',
+              f'├ Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
+              '├ '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
+              '├ '+pair.get('bundler_text','Bundled —').replace('🎯 ',''),
+              f'└ Equipo: {ratio(stat.get("dev_team_hold_rate"))}',
+              '', f'P: <code>{short(pair.get("pairAddress"))}</code>',
+              f'DEV: <code>{short(dev.get("creator_address"))}</code>',
+              '',f'<code>{mint}</code>']
     if pair.get('call_text'):
-        lines += ['', pair['call_text']]
-    lines += ['', f'<code>{mint}</code>']
+        lines += ['',pair['call_text']]
     return '\n'.join(lines)
 
 
@@ -430,7 +485,7 @@ def sources_text(pair, fetched, gmgn_note=''):
              'Precio y actividad: GMGN. Variaciones calculadas con sus precios al inicio de cada período. Liquidez del pool principal indicado por GMGN.',
              'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
              'ATH de precio: reportado por GMGN. MC al precio ATH marcado ≈ es una estimación con suministro circulante actual, no el MC histórico. Snipers: suma de participaciones de holders etiquetados por GMGN, consulta limitada a 100 carteras; una lista de 100 es parcial. Calls: primer contrato recibido por el bot en cada grupo; precio de referencia de la primera consulta, no precio exacto del mensaje. La variación se actualiza al consultar, sin alertas automáticas.',
-             'Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
+             'Edad: fecha de creación del token según GMGN; no se sustituye por la edad del pool. Equipo: suministro en carteras etiquetadas como equipo. No se calcula una puntuación de auditoría ni se equipara volumen de bundlers con suministro retenido. Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
     created = number(pair.get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
         lines.append(f'Creación del par (no del token): {stamp(created / 1000)}')
@@ -634,6 +689,10 @@ class Bot:
                     pair['sniper_text'] = self.scanner.current_snipers(arg)
                 except DataError:
                     pair['sniper_text'] = '🎯 Snipers —'
+                try:
+                    pair['bundler_text']=self.scanner.current_tag_holdings(arg,'bundler')
+                except DataError:
+                    pair['bundler_text']='Bundled —'
                 pair['call_text'] = call_text(self.scanner.store.first_call(chat, call_key), pair.get('priceUsd'))
                 return self.send_card(chat, card(arg, pair, fetched, info),
                                       self.network_keyboard(chat,arg,pair,user), self.scanner.images(arg,info))
