@@ -72,9 +72,21 @@ def fetch(url, payload=None, timeout=20):
     try:
         with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=timeout) as response:
             return json.load(response)
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-        # Do not expose URLs: Telegram URLs contain a secret token.
-        raise DataError('Proveedor no disponible, acceso denegado o límite de consultas.') from None
+    except urllib.error.HTTPError as error:
+        # Only a fixed provider label and numeric status; never expose credential URLs.
+        host = urllib.parse.urlsplit(url).hostname
+        provider = {'api.geckoterminal.com': 'GeckoTerminal (historial)',
+                    'api.dexscreener.com': 'DexScreener (mercado)',
+                    'api.telegram.org': 'Telegram'}.get(host, 'Proveedor')
+        reasons = {400: 'petición no aceptada', 401: 'autenticación requerida',
+                   403: 'acceso denegado', 404: 'recurso no encontrado',
+                   429: 'límite de consultas alcanzado'}
+        reason = reasons.get(error.code, 'error del servicio')
+        raise DataError(f'{provider}: HTTP {error.code} — {reason}.') from None
+    except (TimeoutError, urllib.error.URLError, OSError):
+        raise DataError('No se pudo conectar con el proveedor o se agotó el tiempo de espera.') from None
+    except ValueError:
+        raise DataError('El proveedor devolvió una respuesta no válida.') from None
 
 
 def select_pair(rows, mint):
