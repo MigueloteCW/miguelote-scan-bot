@@ -109,6 +109,11 @@ def fetch(url, payload=None, timeout=20):
         provider = {'api.geckoterminal.com': 'GeckoTerminal (historial)',
                     'api.dexscreener.com': 'DexScreener (mercado)',
                     'api.telegram.org': 'Telegram'}.get(host, 'Proveedor')
+        if host=='api.telegram.org' and error.code==400 and url.rsplit('/',1)[-1] in ('editMessageText','editMessageCaption'):
+            try:
+                detail=json.loads(error.read(16384)).get('description','')
+                if 'message is not modified' in detail.lower():return {'ok':True,'result':True}
+            except (ValueError,OSError,AttributeError):pass
         reasons = {400: 'petición no aceptada', 401: 'autenticación requerida',
                    403: 'acceso denegado', 404: 'recurso no encontrado',
                    429: 'límite de consultas alcanzado'}
@@ -620,6 +625,23 @@ class Bot:
                 continue
         return self.send(chat, text, markup)
 
+    def edit_card(self,msg,text,markup):
+        payload={'chat_id':msg['chat']['id'],'message_id':msg['message_id'],
+                 'parse_mode':'HTML','reply_markup':markup}
+        if msg.get('photo'):
+            # Keep the existing image. Never post a replacement card after an edit failure.
+            visible=html.unescape(re.sub(r'<[^>]+>','',text))
+            if len(visible.encode('utf-16-le'))//2>1024:
+                raise DataError('La ficha actualizada supera el espacio de esta foto. Se conserva la anterior.')
+            payload['caption']=text
+            return self.api('editMessageCaption',payload)
+        payload.update(text=text,link_preview_options={'is_disabled':True})
+        return self.api('editMessageText',payload)
+
+    def callback_notice(self,callback,text):
+        try:return self.api('answerCallbackQuery',{'callback_query_id':callback['id'],'text':text[:180],'show_alert':True})
+        except DataError:return None
+
     def network_keyboard(self, chat, mint, pair, user):
         chain=self.scanner.chain
         ref=self.scanner.store.reference({'chat':chat,'mint':mint,'chain':chain})
@@ -674,6 +696,9 @@ class Bot:
                 if not arg:
                     return
                 action = 'scan'
+        refreshing=bool(callback and action=='scan' and any(
+            'Actualizar' in b.get('text','')
+            for row in (msg.get('reply_markup') or {}).get('inline_keyboard',[]) for b in row))
         if action == 'missingpool':
             return self.send(chat, 'GMGN no ha devuelto un pool válido para abrir este gráfico. Puedes usar el botón GMGN.')
         if action in ('start', 'help'):
@@ -694,6 +719,7 @@ class Bot:
         if arg.startswith('ref_'):
             ref=self.scanner.store.reference(key=arg[4:])
             if not ref or ref.get('chat') != chat:
+                if refreshing:return self.callback_notice(callback,'Esta ficha ha caducado. Envía de nuevo el contrato.')
                 return self.send(chat,'Esta ficha ha caducado. Envía de nuevo el contrato.')
             chain,arg=ref['chain'],ref['mint']
         elif ':' in arg:
@@ -726,6 +752,7 @@ class Bot:
             return self.send(chat,esc(str(error),500))
         self.scanner.chain=chain
         if time.monotonic() - self.last_request.get(user, -100) < 3:
+            if refreshing:return self.callback_notice(callback,'Espera unos segundos antes de actualizar.')
             return self.send(chat, 'Espera unos segundos antes de la siguiente consulta.')
         self.last_request[user] = time.monotonic()
         try:
@@ -741,6 +768,8 @@ class Bot:
                     pair['bundler_text']=self.scanner.current_tag_holdings(arg,'bundler')
                 except DataError:
                     pair['bundler_text']='Bundled —'
+                if refreshing:
+                    return self.edit_card(msg,card(arg,pair,fetched,info),self.network_keyboard(chat,arg,pair,user))
                 return self.send_card(chat, card(arg, pair, fetched, info),
                                       self.network_keyboard(chat,arg,pair,user), self.scanner.images(arg,info))
             if action == 'sources':
@@ -760,6 +789,7 @@ class Bot:
                                  '\nParticipación actual del suministro en carteras etiquetadas. GMGN: hasta 100 carteras; Aser: solo lecturas completas y recientes. No mide las compras al lanzamiento.\n' +
                                  f'Consulta/caché de hasta 60 s · {stamp(time.time())}')
         except DataError as error:
+            if refreshing:return self.callback_notice(callback,'No se pudo actualizar. Se conserva la ficha anterior. Inténtalo de nuevo.')
             return self.send(chat, esc(str(error), 500))
 
     def run(self):
