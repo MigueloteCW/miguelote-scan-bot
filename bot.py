@@ -1,5 +1,6 @@
-"""Veraz Bot 0.1: read-only Solana scanner. Python 3.11+, stdlib only."""
+"""Miguelote Scan: read-only multichain scanner. Python 3.11+, stdlib only."""
 import argparse
+import hashlib
 import html
 import json
 import math
@@ -49,6 +50,19 @@ def valid_address(value):
         n = n * 58 + ALPHABET.index(c)
     size = (n.bit_length() + 7) // 8 + len(value) - len(value.lstrip('1'))
     return size == 32
+
+
+GMGN_CHAINS = {'solana':'sol','ethereum':'eth','bsc':'bsc','base':'base','arbitrum':'arbitrum',
+               'hyperevm':'hyperevm','robinhood':'robinhood','arc':'arc','stable':'stable','avalanche':'avalanche'}
+
+def valid_contract(value):
+    return isinstance(value, str) and (valid_address(value) or bool(re.fullmatch(r'0x[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?', value)) or bool(re.fullmatch(r'T[1-9A-HJ-NP-Za-km-z]{33}', value)))
+
+def normalized(value):
+    return value.lower() if isinstance(value,str) and value.startswith('0x') else value
+
+def same_token(a,b):
+    return isinstance(a,str) and normalized(a)==normalized(b)
 
 
 def number(value):
@@ -146,6 +160,16 @@ class Store:
             self.db.commit()
 
 
+    def reference(self, data=None, key=None):
+        if data is not None:
+            value=json.dumps(data,sort_keys=True)
+            key=hashlib.sha256(value.encode()).hexdigest()[:20]
+            self.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', ('ref:'+key,value))
+            self.db.commit()
+            return key
+        row=self.db.execute('SELECT value FROM state WHERE key=?',('ref:'+key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
     def preference(self, user, provider=None):
         if provider is not None:
             if provider not in ('dexscreener', 'dextools'):
@@ -172,10 +196,45 @@ class Scanner:
         self.store, self.transport, self.gmgn = store, transport, gmgn
         self.cache = {}
         self.gmgn_blocked_until = 0
+        self.chain = "solana"
+
+    def dex_pairs(self, mint):
+        key=('dex', normalized(mint))
+        if key in self.cache and time.time()-self.cache[key][0]<60:
+            return self.cache[key][1]
+        data=self.transport('https://api.dexscreener.com/latest/dex/search?q='+urllib.parse.quote(mint,safe=''))
+        rows=data.get('pairs') if isinstance(data,dict) else None
+        if not isinstance(rows,list):
+            raise DataError('Mercado no disponible. Inténtalo más tarde.')
+        rows=[p for p in rows if isinstance(p,dict) and same_token((p.get('baseToken') or {}).get('address'),mint)
+              and isinstance(p.get('chainId'),str) and re.fullmatch(r'[a-z0-9-]{1,40}',p['chainId'])]
+        self.cache[key]=(time.time(),rows)
+        return rows
+
+    def images(self, mint, info):
+        urls=[info.get('logo')]
+        try:
+            rows=[p for p in self.dex_pairs(mint) if p['chainId']==self.chain]
+            rows.sort(key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0,reverse=True)
+            urls += [(p.get('info') or {}).get('imageUrl') for p in rows]
+        except DataError:
+            pass
+        return list(dict.fromkeys(u for u in urls if isinstance(u,str) and u.startswith('https://') and len(u)<2048))[:3]
 
     def market(self, mint):
+        try:
+            return self.gmgn_market(mint)
+        except DataError:
+            rows=[p for p in self.dex_pairs(mint) if p['chainId']==self.chain]
+            if not rows:
+                raise DataError('Sin datos para este contrato y red.')
+            pair=dict(max(rows,key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0))
+            pair.update(gmgn_info={},source='DexScreener')
+            return pair,rows,self.cache[('dex',normalized(mint))][0]
+
+    def gmgn_market(self, mint):
         info = self.gmgn_query('info', mint)
-        if info.get('address') != mint:
+        if not same_token(info.get('address'), mint):
             raise DataError('GMGN no confirmó el contrato solicitado.')
         price = info.get('price') if isinstance(info.get('price'), dict) else {}
         pool = info.get('pool') if isinstance(info.get('pool'), dict) else {}
@@ -189,33 +248,38 @@ class Scanner:
             changes[field] = (current / old - 1) * 100 if current is not None and old is not None and old > 0 else None
         address = info.get('biggest_pool_address') or pool.get('pool_address')
         pair = {'baseToken': {'name': info.get('name', 'Token'), 'symbol': info.get('symbol', '?')},
-                'pairAddress': address if valid_address(address) else None,
+                'pairAddress': address if valid_contract(address) else None,
+                'chainId': self.chain, 'source': 'GMGN',
                 'dexId': pool.get('exchange', 'GMGN'), 'priceUsd': current,
                 'marketCap': product(info.get('circulating_supply')), 'fdv': product(info.get('total_supply')),
                 'liquidity': {'usd': info.get('liquidity') if info.get('liquidity') is not None else pool.get('liquidity')},
                 'volume': {'h24': price.get('volume_24h')}, 'priceChange': changes,
                 'txns': {'h24': {'buys': price.get('buys_24h'), 'sells': price.get('sells_24h')}},
                 'gmgn_info': info}
-        fetched = self.cache.get(('gmgn', 'info', mint), (time.time(),))[0]
+        fetched = self.cache.get(('gmgn', self.chain, 'info', normalized(mint)), (time.time(),))[0]
         return pair, [pair], fetched
 
     def gmgn_query(self, command, mint):
-        if not valid_address(mint):
-            raise DataError('Contrato inválido.')
+        if not valid_contract(mint) or self.chain not in GMGN_CHAINS:
+            raise DataError('Sin cobertura de GMGN para esta red.')
         if not self.gmgn:
             raise DataError('GMGN pendiente de configurar: hace falta su clave API de consulta.')
+        key = ('gmgn', self.chain, command, normalized(mint))
+        if key in self.cache and time.time() - self.cache[key][0] < 60:
+            return self.cache[key][1]
         if time.time() < self.gmgn_blocked_until:
             raise DataError('GMGN en pausa por límite de consultas; vuelve a intentarlo más tarde.')
         if not shutil.which('gmgn-cli'):
             raise DataError('Falta instalar gmgn-cli en el equipo del bot.')
-        key = ('gmgn', command, mint)
-        if key in self.cache and time.time() - self.cache[key][0] < 60:
-            return self.cache[key][1]
-        args = ['gmgn-cli', 'token', 'holders' if command == 'sniper_holders' else command, '--chain', 'sol', '--address', mint, '--raw']
+        args = ['gmgn-cli', 'token', 'holders' if command == 'sniper_holders' else command, '--chain', GMGN_CHAINS[self.chain], '--address', mint, '--raw']
         if command == 'sniper_holders':
             args += ['--tag', 'sniper', '--limit', '100', '--order-by', 'amount_percentage', '--direction', 'desc']
         if command == 'holders':
             args += ['--limit', '10', '--order-by', 'amount_percentage', '--direction', 'desc']
+        delay = 1.1 - (time.monotonic() - self.cache.get(('gmgn_last',), 0))
+        if delay > 0:
+            time.sleep(delay)
+        self.cache[('gmgn_last',)] = time.monotonic()
         try:
             proc = subprocess.run(args, capture_output=True, text=True, timeout=25, check=False)
             if proc.returncode:
@@ -243,7 +307,7 @@ class Scanner:
             raise DataError('GMGN no devolvió la lista de snipers actuales.')
         seen, total = set(), 0.0
         for row in rows:
-            if not isinstance(row, dict) or not valid_address(row.get('address')):
+            if not isinstance(row, dict) or not valid_contract(row.get('address')):
                 raise DataError('Lista sniper incompleta o no válida.')
             ratio = number(row.get('amount_percentage'))
             if ratio is None or not 0 <= ratio <= 1 or row['address'] in seen:
@@ -252,8 +316,8 @@ class Scanner:
             total += ratio
         if total > 1.000001:
             raise DataError('Porcentajes sniper inconsistentes.')
-        label = 'Snipers actuales (parcial, 100 carteras)' if len(rows) >= 100 else 'Snipers actuales (GMGN)'
-        return f'🎯 {label}: {fmt(total, ratio=True)} del suministro'
+        label = 'Snipers (parcial)' if len(rows) >= 100 else 'Snipers'
+        return f'🎯 {label}: {fmt(total, ratio=True)}'
 
     def history(self, mint):
         pair, _, fetched = self.market(mint)
@@ -313,8 +377,8 @@ def change(value):
 def ath_mc(info):
     ath, supply = number(info.get('ath_price')), number(info.get('circulating_supply'))
     if ath is None or ath <= 0 or supply is None or supply < 0:
-        return 'MC al precio ATH: — (sin suministro histórico)'
-    return f'MC al precio ATH ≈ {compact(ath * supply, True)}*'
+        return 'MC estimado —'
+    return f'MC estimado ≈ {compact(ath * supply, True)}'
 
 
 def call_text(record, current):
@@ -329,10 +393,10 @@ def call_text(record, current):
 def ath_line(info, current):
     ath, current = number(info.get('ath_price')), number(current)
     if ath is None or ath <= 0:
-        return '🏔 <b>ATH de precio: no disponible</b>'
+        return '🏔 ATH —'
     if current is not None and ath < current:
         return '🏔 <b>ATH de precio: dato inconsistente</b>'
-    return f'🏔 <b>ATH precio {fmt(ath, money=True)}</b> · {ath_mc(info)}'
+    return f'🏔 <b>ATH {fmt(ath, money=True)}</b> · {ath_mc(info)}'
 
 
 def card(mint, pair, fetched, info=None, gmgn_note=''):
@@ -344,7 +408,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     price = fmt(pair.get('priceUsd'), money=True) if number(pair.get('priceUsd')) is not None else '—'
     top = fmt(stat.get('top_10_holder_rate'), ratio=True) if number(stat.get('top_10_holder_rate')) is not None else '—'
     lines = [f'<b>{esc(base.get("name", "Token"))} · ${esc(base.get("symbol", "?"), 25)}</b>',
-             f'Solana · {esc(pair.get("dexId", "DEX"))}',
+             f'{esc(pair.get("chainId", "solana").title())} · {esc(pair.get("dexId", "DEX"))}',
              f'💵 <b>{price}</b>', '',
              f'MC <b>{compact(pair.get("marketCap"), True)}</b> · Liq <b>{compact((pair.get("liquidity") or {}).get("usd"), True)}</b>',
              f'FDV {compact(pair.get("fdv"), True)} · Vol 24h {compact((pair.get("volume") or {}).get("h24"), True)}',
@@ -353,21 +417,16 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
              ath_line(info, pair.get('priceUsd')),
              f'👥 Holders {compact(info.get("holder_count"))} · Top 10 {top}',
              pair.get('sniper_text', '🎯 Snipers actuales: —')]
-    if gmgn_note:
-        lines.append('<i>GMGN: datos no disponibles</i>')
+
     if pair.get('call_text'):
         lines += ['', pair['call_text']]
-    if '≈' in ath_mc(info):
-        lines.append('<i>*Estimación con suministro circulante actual; MC histórico sin verificar.</i>')
-    lines += ['', f'<code>{mint}</code>', '',
-              f'<i>GMGN · Consulta {stamp(fetched)}</i>',
-              '<i>— Sin datos · Detalles en «Fuentes»</i>']
+    lines += ['', f'<code>{mint}</code>']
     return '\n'.join(lines)
 
 
 def sources_text(pair, fetched, gmgn_note=''):
-    lines = ['<b>Fuentes y alcance</b>',
-             'Mercado: GMGN. MC = precio × suministro circulante. FDV = precio × suministro total; no se sustituye MC por FDV.',
+    lines = ['<b>Fuentes y alcance</b>', f'Mercado de esta ficha: {esc(pair.get("source","GMGN"))}. Red: {esc(pair.get("chainId","solana"))}. Imágenes: logo GMGN y alternativa DexScreener.',
+             'Con GMGN: MC = precio × suministro circulante; FDV = precio × suministro total. Con DexScreener: valores reportados, sin sustituir MC por FDV.',
              'Precio y actividad: GMGN. Variaciones calculadas con sus precios al inicio de cada período. Liquidez del pool principal indicado por GMGN.',
              'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
              'ATH de precio: reportado por GMGN. MC al precio ATH marcado ≈ es una estimación con suministro circulante actual, no el MC histórico. Snipers: suma de participaciones de holders etiquetados por GMGN, consulta limitada a 100 carteras; una lista de 100 es parcial. Calls: primer contrato recibido por el bot en cada grupo; precio de referencia de la primera consulta, no precio exacto del mensaje. La variación se actualiza al consultar, sin alertas automáticas.',
@@ -382,17 +441,17 @@ def sources_text(pair, fetched, gmgn_note=''):
     return '\n\n'.join(lines)
 
 
-def holders_text(data):
+def holders_text(data, chain='solana'):
     rows = data.get('list')
     if not isinstance(rows, list):
         raise DataError('Lista de holders no disponible en GMGN.')
     lines = ['<b>Top holders · reportado por GMGN</b>']
     for index, row in enumerate(rows[:10], 1):
         addr = row.get('address')
-        if not valid_address(addr):
+        if not valid_contract(addr):
             continue
         kind = 'Exchange / pool' if row.get('addr_type') == 2 else 'Sin clasificar'
-        lines.append(f'{index}. <a href="https://solscan.io/account/{addr}">{addr[:6]}…{addr[-4:]}</a> '
+        lines.append(f'{index}. <code>{addr[:6]}…{addr[-4:]}</code> '
                      f'· {fmt(row.get("amount_percentage"), ratio=True)} · {fmt(row.get("balance"))} tokens · {kind}')
     if len(lines) == 1:
         lines.append('No hay filas válidas disponibles; no implica cero holders.')
@@ -401,8 +460,8 @@ def holders_text(data):
     return '\n'.join(lines)
 
 
-HELP = ('<b>Veraz · versión inicial para Solana</b>\n'
-        'Pega un contrato o utiliza /scan CONTRATO.\n'
+HELP = ('<b>Miguelote Scan · Multired</b>\n'
+        'Pega un contrato o utiliza /scan RED:CONTRATO. Ejemplo: base:0x…\n'
         '/chart — elegir DexScreener o DEXTools\n'
         '/holders CONTRATO — top holders GMGN\n'
         '/snipers CONTRATO — detección GMGN\n'
@@ -431,7 +490,10 @@ class Bot:
         return self.api('sendMessage', payload)
 
     def send_card(self, chat, text, markup, logo):
-        if isinstance(logo, str) and logo.startswith('https://') and len(logo) < 2048:
+        logos = logo if isinstance(logo, list) else [logo]
+        for logo in logos:
+            if not isinstance(logo,str) or not logo.startswith('https://') or len(logo)>=2048:
+                continue
             payload = {'chat_id': chat, 'photo': logo}
             fits = len(text.encode('utf-16-le')) // 2 <= 1024
             if fits:
@@ -440,9 +502,34 @@ class Bot:
                 result = self.api('sendPhoto', payload)
                 if fits:
                     return result
+                break
             except DataError:
-                text += '\n<i>Imagen no disponible.</i>'
+                continue
         return self.send(chat, text, markup)
+
+    def network_keyboard(self, chat, mint, pair, user):
+        chain=self.scanner.chain
+        ref=self.scanner.store.reference({'chat':chat,'mint':mint,'chain':chain})
+        data='ref_'+ref
+        markup=keyboard(mint,pair.get('pairAddress'),self.scanner.store.preference(user))
+        for row in markup['inline_keyboard']:
+            for button in row:
+                if ':' in button.get('callback_data',''):
+                    button['callback_data']=button['callback_data'].split(':')[0]+':'+data
+        if chain=='solana':
+            return markup
+        q=urllib.parse.quote
+        pool=pair.get('pairAddress')
+        charts=[{'text':'DexScreener','url':f'https://dexscreener.com/{chain}/{q(pool or mint,safe="")}'}]
+        dt={'ethereum':'ether','bsc':'bnb','base':'base','arbitrum':'arbitrum','avalanche':'avalanche','polygon':'polygon'}
+        if pool and chain in dt:
+            charts.append({'text':'DEXTools','url':f'https://www.dextools.io/app/en/{dt[chain]}/pair-explorer/{q(pool,safe="")}'})
+        rows=[charts,markup['inline_keyboard'][2]]
+        rows.append([{'text':'👥 Holders','callback_data':'holders:'+data}])
+        if chain in GMGN_CHAINS:
+            rows[-1].append({'text':'GMGN','url':f'https://gmgn.ai/{GMGN_CHAINS[chain]}/token/{mint}'})
+        rows+=markup['inline_keyboard'][4:]
+        return {'inline_keyboard':rows}
 
     def settings(self, chat):
         self.send(chat, 'Elige tu gráfico preferido. Siempre tendrás disponibles los dos botones.',
@@ -466,11 +553,11 @@ class Bot:
             if text.startswith('/'):
                 first, _, arg = text.partition(' ')
                 action = first.split('@')[0][1:].lower()
-            elif valid_address(text):
+            elif valid_contract(text) or re.fullmatch(r'[a-z0-9-]+:[A-Za-z0-9]+',text):
                 action, arg = 'scan', text
             else:
-                candidates = re.findall(r'(?<![A-Za-z0-9])[1-9A-HJ-NP-Za-km-z]{32,44}(?![A-Za-z0-9])', text)
-                arg = next((x for x in candidates if valid_address(x)), '')
+                candidates = re.findall(r'(?<![A-Za-z0-9])(?:0x[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?|[1-9A-HJ-NP-Za-km-z]{32,44})(?![A-Za-z0-9])', text)
+                arg = next((x for x in candidates if valid_contract(x)), '')
                 if not arg:
                     return
                 action = 'scan'
@@ -490,29 +577,66 @@ class Bot:
             return
         if action not in ('scan', 'ath', 'holders', 'snipers', 'sources'):
             return self.send(chat, HELP)
-        group_call = not callback and action == 'scan' and msg['chat'].get('type') in ('group', 'supergroup') and valid_address(arg)
+        original = None
+        chain = None
+        if arg.startswith('ref_'):
+            ref=self.scanner.store.reference(key=arg[4:])
+            if not ref or ref.get('chat') != chat:
+                return self.send(chat,'Esta ficha ha caducado. Envía de nuevo el contrato.')
+            chain,arg=ref['chain'],ref['mint']
+            original=ref.get('original')
+        elif ':' in arg:
+            chain,arg=arg.split(':',1)
+            chain={'sol':'solana','eth':'ethereum','bnb':'bsc'}.get(chain.lower(),chain.lower())
+        if not valid_contract(arg):
+            return self.send(chat,'Formato no reconocido. Usa /scan RED:CONTRATO con la dirección completa.')
+        arg=normalized(arg)
+        self.scanner.chain='solana'
+        try:
+            if chain is None:
+                if valid_address(arg):
+                    chain='solana'
+                else:
+                    chains=sorted({p['chainId'] for p in self.scanner.dex_pairs(arg)})
+                    if len(chains)==1:
+                        chain=chains[0]
+                    else:
+                        choices=chains or list(GMGN_CHAINS.keys())[1:]
+                        buttons=[]
+                        for c in choices[:30]:
+                            ref=self.scanner.store.reference({'chat':chat,'chain':c,'mint':arg,'original':msg if not callback else None})
+                            buttons.append({'text':c.title(),'callback_data':action+':ref_'+ref})
+                        return self.send(chat,'Elige la red del contrato:',{'inline_keyboard':[buttons[i:i+2] for i in range(0,len(buttons),2)]})
+            if not re.fullmatch(r'[a-z0-9-]{1,40}',chain):
+                raise DataError('Red no válida.')
+            if chain=='solana' and not valid_address(arg):
+                raise DataError('El contrato no tiene formato Solana.')
+        except DataError as error:
+            return self.send(chat,esc(str(error),500))
+        self.scanner.chain=chain
+        origin=original or msg
+        group_call = action=='scan' and (not callback or original is not None) and origin['chat'].get('type') in ('group','supergroup')
+        call_key=arg if chain=='solana' else chain+':'+arg
         if group_call:
-            sender = msg.get('sender_chat') or msg.get('from') or {}
-            author = ('@' + sender['username']) if sender.get('username') else sender.get('title') or sender.get('first_name') or 'Autor no identificado'
-            self.scanner.store.first_call(chat, arg, author, msg.get('message_id'), msg.get('date', time.time()))
+            sender=origin.get('sender_chat') or origin.get('from') or {}
+            author=('@'+sender['username']) if sender.get('username') else sender.get('title') or sender.get('first_name') or 'Autor no identificado'
+            self.scanner.store.first_call(chat,call_key,author,origin.get('message_id'),origin.get('date',time.time()))
         if time.monotonic() - self.last_request.get(user, -100) < 3:
             return self.send(chat, 'Espera unos segundos antes de la siguiente consulta.')
         self.last_request[user] = time.monotonic()
         try:
-            if not valid_address(arg):
-                raise DataError('Pega el contrato completo de Solana después del comando.')
             if action == 'scan':
                 pair, _, fetched = self.scanner.market(arg)
                 info = pair['gmgn_info']
                 if group_call:
-                    self.scanner.store.quote_call(chat, arg, msg.get('message_id'), pair.get('priceUsd'), fetched)
+                    self.scanner.store.quote_call(chat, call_key, origin.get('message_id'), pair.get('priceUsd'), fetched)
                 try:
                     pair['sniper_text'] = self.scanner.current_snipers(arg)
                 except DataError:
-                    pair['sniper_text'] = '🎯 Snipers actuales: — (consulta no disponible)'
-                pair['call_text'] = call_text(self.scanner.store.first_call(chat, arg), pair.get('priceUsd'))
+                    pair['sniper_text'] = '🎯 Snipers —'
+                pair['call_text'] = call_text(self.scanner.store.first_call(chat, call_key), pair.get('priceUsd'))
                 return self.send_card(chat, card(arg, pair, fetched, info),
-                                      keyboard(arg, pair['pairAddress'], self.scanner.store.preference(user)), info.get('logo'))
+                                      self.network_keyboard(chat,arg,pair,user), self.scanner.images(arg,info))
             if action == 'sources':
                 pair, _, fetched = self.scanner.market(arg)
                 note = ''
@@ -524,7 +648,7 @@ class Bot:
             if action == 'ath':
                 return self.send(chat, self.scanner.history(arg))
             if action == 'holders':
-                return self.send(chat, holders_text(self.scanner.gmgn_query('holders', arg)))
+                return self.send(chat, holders_text(self.scanner.gmgn_query('holders', arg),chain))
             if action == 'snipers':
                 return self.send(chat, self.scanner.current_snipers(arg) +
                                  '\nParticipación actual de las carteras etiquetadas por GMGN; no porcentaje de compras al lanzamiento. Consulta limitada a 100 carteras.\n' +
