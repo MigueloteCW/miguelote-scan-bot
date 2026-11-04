@@ -143,22 +143,7 @@ class Store:
         self.db.execute('CREATE TABLE IF NOT EXISTS snapshots (mint TEXT, fetched REAL, pair TEXT, payload TEXT)')
         self.db.execute('CREATE INDEX IF NOT EXISTS by_mint ON snapshots(mint,fetched)')
         self.db.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)')
-        self.db.execute('CREATE TABLE IF NOT EXISTS calls (chat INTEGER, mint TEXT, author TEXT, message_id INTEGER, called_at REAL, price REAL, quoted_at REAL, PRIMARY KEY(chat,mint))')
-
-    def first_call(self, chat, mint, author=None, message_id=None, called_at=None):
-        if author is not None:
-            self.db.execute('INSERT OR IGNORE INTO calls(chat,mint,author,message_id,called_at) VALUES (?,?,?,?,?)',
-                            (chat, mint, author, message_id, called_at))
-            self.db.commit()
-        return self.db.execute('SELECT author,message_id,called_at,price,quoted_at FROM calls WHERE chat=? AND mint=?', (chat,mint)).fetchone()
-
-    def quote_call(self, chat, mint, message_id, price, quoted_at):
-        price = number(price)
-        if price is not None and price > 0:
-            self.db.execute('UPDATE calls SET price=?,quoted_at=? WHERE chat=? AND mint=? AND message_id=? AND price IS NULL',
-                            (price,quoted_at,chat,mint,message_id))
-            self.db.commit()
-
+        self.db.commit()
 
     def reference(self, data=None, key=None):
         if data is not None:
@@ -211,8 +196,44 @@ class Scanner:
         self.cache[key]=(time.time(),rows)
         return rows
 
+    def aser(self, mint, live=False):
+        # Public read-only API, currently Solana only. Never use peak_mcap as ATH.
+        if self.chain!='solana':raise DataError('Aser no disponible para esta red.')
+        key=('aser', 'coin' if live else 'token', mint)
+        if key in self.cache and time.time()-self.cache[key][0]<60:
+            result=self.cache[key][1]
+            if result is None:raise DataError('Aser no disponible.')
+            return result
+        try:
+            result=self.transport('https://aser.trade/api/'+key[1]+'/'+urllib.parse.quote(mint,safe=''))
+            item=result if live else result.get('token')
+            if not isinstance(item,dict) or item.get('mint')!=mint:raise DataError('Aser no confirmó el contrato.')
+            self.cache[key]=(time.time(),item)
+            return item
+        except (DataError,AttributeError,TypeError):
+            self.cache[key]=(time.time(),None)
+            raise DataError('Aser no disponible.') from None
+
+    def aser_snipers(self,mint):
+        data=self.aser(mint,live=True)
+        ledger=data.get('holders') or {}
+        info=data.get('info') or {}
+        checked=number(info.get('checked'))
+        if not checked or not 0<=time.time()-checked/1000<=120 or ledger.get('stale') or ledger.get('partial') or ledger.get('frozen'):
+            raise DataError('Aser no dispone de una lectura actual y completa de snipers.')
+        reading=info.get('snipers')
+        pct=number(reading.get('pct')) if isinstance(reading,dict) else number(reading)
+        if pct is None or not 0<=pct<=100:raise DataError('Snipers no disponibles en Aser.')
+        return f'🎯 Snipers: {pct:.2f}% (Aser)'
+
     def images(self, mint, info):
-        urls=[info.get('logo')]
+        urls=[]
+        try:
+            metadata=self.aser(mint)
+            urls += [metadata.get('header'),metadata.get('image')]
+        except DataError:
+            pass
+        urls.append(info.get('logo'))
         try:
             rows=[p for p in self.dex_pairs(mint) if p['chainId']==self.chain]
             rows.sort(key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0,reverse=True)
@@ -220,6 +241,11 @@ class Scanner:
         except DataError:
             pass
         return list(dict.fromkeys(u for u in urls if isinstance(u,str) and u.startswith('https://') and len(u)<2048))[:3]
+
+    def refresh_market(self,mint):
+        self.cache.pop(('gmgn',self.chain,'info',normalized(mint)),None)
+        self.cache.pop(('dex',normalized(mint)),None)
+        return self.market(mint)
 
     def market(self, mint):
         try:
@@ -231,6 +257,20 @@ class Scanner:
             pair=dict(max(rows,key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0))
             pair.update(gmgn_info={},source='DexScreener')
             return pair,rows,self.cache[('dex',normalized(mint))][0]
+
+    def enrich_activity(self,mint,pair):
+        # Enrich only the selected pool on the selected chain; never a different market.
+        result=dict(pair)
+        try:
+            matches=[p for p in self.dex_pairs(mint)
+                     if p.get('chainId')==pair.get('chainId')
+                     and pair.get('pairAddress') and same_token(p.get('pairAddress'),pair['pairAddress'])]
+            if matches:
+                row=matches[0]
+                result['activity_extra']={k:row.get(k) for k in ('txns','boosts','pairCreatedAt')}
+        except DataError:
+            pass
+        return result
 
     def gmgn_market(self, mint):
         info = self.gmgn_query('info', mint)
@@ -301,7 +341,8 @@ class Scanner:
         return data
 
     def current_snipers(self, mint):
-        return self.current_tag_holdings(mint,'sniper')
+        try:return self.current_tag_holdings(mint,'sniper')
+        except DataError:return self.aser_snipers(mint)
 
     def current_tag_holdings(self, mint, tag):
         if tag not in ('sniper','bundler'):
@@ -387,15 +428,6 @@ def ath_mc(info):
     return f'MC estimado ≈ {compact(ath * supply, True)}'
 
 
-def call_text(record, current):
-    if not record:
-        return ''
-    author, message_id, when, initial, quoted_at = record
-    current = number(current)
-    variation = change((current / initial - 1) * 100) if initial and current is not None else '— (sin precio inicial)'
-    return f'📣 Primera call registrada: <b>{esc(author, 70)}</b>\nDesde su call: <b>{variation}</b>\n<i>{stamp(when)}</i>'
-
-
 def ath_line(info, current):
     ath, current = number(info.get('ath_price')), number(current)
     if ath is None or ath <= 0:
@@ -422,6 +454,32 @@ def age_text(timestamp, now):
     if seconds>=86400: return str(int(seconds//86400))+'d'
     if seconds>=3600: return str(int(seconds//3600))+'h'
     return str(int(seconds//60))+'m'
+
+
+def activity_lines(pair,now):
+    extra=pair.get('activity_extra') or (pair if pair.get('source')=='DexScreener' else {})
+    txns=extra.get('txns') if isinstance(extra.get('txns'),dict) else {}
+    def count(value):
+        n=number(value)
+        return compact(n) if n is not None and n>=0 and n.is_integer() else '—'
+    def transactions(window):
+        tx=txns.get(window) if isinstance(txns.get(window),dict) else {}
+        return count(tx.get('buys'))+' / '+count(tx.get('sells'))
+    liq=number((pair.get('liquidity') or {}).get('usd'))
+    mc=number(pair.get('marketCap'))
+    volume=number((pair.get('volume') or {}).get('h24'))
+    liquidity_ratio=f'{100*liq/mc:.2f}%' if liq is not None and liq>=0 and mc is not None and mc>0 else '—'
+    turnover=f'{volume/liq:.2f}×' if volume is not None and volume>=0 and liq is not None and liq>0 else '—'
+    boosts=extra.get('boosts') if isinstance(extra.get('boosts'),dict) else {}
+    created=number(extra.get('pairCreatedAt'))
+    age=age_text(created/1000 if created else None,now)
+    return ['', '⚡ <b>Actividad del par</b>',
+            f'├ C/V 5m: <b>{transactions("m5")}</b>',
+            f'├ C/V 1h: <b>{transactions("h1")}</b>',
+            f'├ LIQ/MC: <b>{liquidity_ratio}</b>',
+            f'├ VOL/LIQ 24h: <b>{turnover}</b>',
+            f'├ Edad del par: <b>{age}</b>',
+            f'└ Boosts DEX: <b>{count(boosts.get("active"))}</b>']
 
 
 def card(mint, pair, fetched, info=None, gmgn_note=''):
@@ -451,6 +509,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
            f'├ B/S: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24h)',
            f'└ HLD: <b>{compact(info.get("holder_count"))}</b>', '',
            '🏔 <b>ATH</b>']
+    lines=lines[:-2]+activity_lines(pair,fetched)+['','🏔 <b>ATH</b>']
     if ath is not None and ath>0 and (current is None or current<=ath):
         lines += [f'├ Precio: <b>{fmt(ath,money=True)}</b>',f'├ {ath_mc(info)}']
         drop=(current/ath-1)*100 if current is not None else None
@@ -474,8 +533,6 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
               '', f'P: <code>{short(pair.get("pairAddress"))}</code>',
               f'DEV: <code>{short(dev.get("creator_address"))}</code>',
               '',f'<code>{mint}</code>']
-    if pair.get('call_text'):
-        lines += ['',pair['call_text']]
     return '\n'.join(lines)
 
 
@@ -484,7 +541,8 @@ def sources_text(pair, fetched, gmgn_note=''):
              'Con GMGN: MC = precio × suministro circulante; FDV = precio × suministro total. Con DexScreener: valores reportados, sin sustituir MC por FDV.',
              'Precio y actividad: GMGN. Variaciones calculadas con sus precios al inicio de cada período. Liquidez del pool principal indicado por GMGN.',
              'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
-             'ATH de precio: reportado por GMGN. MC al precio ATH marcado ≈ es una estimación con suministro circulante actual, no el MC histórico. Snipers: suma de participaciones de holders etiquetados por GMGN, consulta limitada a 100 carteras; una lista de 100 es parcial. Calls: primer contrato recibido por el bot en cada grupo; precio de referencia de la primera consulta, no precio exacto del mensaje. La variación se actualiza al consultar, sin alertas automáticas.',
+             'ATH de precio: reportado por GMGN. MC al precio ATH marcado ≈ es una estimación con suministro circulante actual, no el MC histórico. Snipers: suma de participaciones de holders etiquetados por GMGN, consulta limitada a 100 carteras; una lista de 100 es parcial.',
+             'Actividad del par: C/V son cantidades de compras/ventas, no dólares ni personas únicas. Ventanas 5m y 1h, edad del par y boosts: DexScreener, solo para el mismo pool y red. Boosts son promoción, no garantía de calidad. LIQ/MC = liquidez / capitalización × 100; VOL/LIQ = volumen 24h / liquidez. Son relaciones descriptivas, no medidas de seguridad.',
              'Edad: fecha de creación del token según GMGN; no se sustituye por la edad del pool. Equipo: suministro en carteras etiquetadas como equipo. No se calcula una puntuación de auditoría ni se equipara volumen de bundlers con suministro retenido. Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
     created = number(pair.get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
@@ -632,14 +690,12 @@ class Bot:
             return
         if action not in ('scan', 'ath', 'holders', 'snipers', 'sources'):
             return self.send(chat, HELP)
-        original = None
         chain = None
         if arg.startswith('ref_'):
             ref=self.scanner.store.reference(key=arg[4:])
             if not ref or ref.get('chat') != chat:
                 return self.send(chat,'Esta ficha ha caducado. Envía de nuevo el contrato.')
             chain,arg=ref['chain'],ref['mint']
-            original=ref.get('original')
         elif ':' in arg:
             chain,arg=arg.split(':',1)
             chain={'sol':'solana','eth':'ethereum','bnb':'bsc'}.get(chain.lower(),chain.lower())
@@ -659,7 +715,7 @@ class Bot:
                         choices=chains or list(GMGN_CHAINS.keys())[1:]
                         buttons=[]
                         for c in choices[:30]:
-                            ref=self.scanner.store.reference({'chat':chat,'chain':c,'mint':arg,'original':msg if not callback else None})
+                            ref=self.scanner.store.reference({'chat':chat,'chain':c,'mint':arg})
                             buttons.append({'text':c.title(),'callback_data':action+':ref_'+ref})
                         return self.send(chat,'Elige la red del contrato:',{'inline_keyboard':[buttons[i:i+2] for i in range(0,len(buttons),2)]})
             if not re.fullmatch(r'[a-z0-9-]{1,40}',chain):
@@ -669,22 +725,14 @@ class Bot:
         except DataError as error:
             return self.send(chat,esc(str(error),500))
         self.scanner.chain=chain
-        origin=original or msg
-        group_call = action=='scan' and (not callback or original is not None) and origin['chat'].get('type') in ('group','supergroup')
-        call_key=arg if chain=='solana' else chain+':'+arg
-        if group_call:
-            sender=origin.get('sender_chat') or origin.get('from') or {}
-            author=('@'+sender['username']) if sender.get('username') else sender.get('title') or sender.get('first_name') or 'Autor no identificado'
-            self.scanner.store.first_call(chat,call_key,author,origin.get('message_id'),origin.get('date',time.time()))
         if time.monotonic() - self.last_request.get(user, -100) < 3:
             return self.send(chat, 'Espera unos segundos antes de la siguiente consulta.')
         self.last_request[user] = time.monotonic()
         try:
             if action == 'scan':
-                pair, _, fetched = self.scanner.market(arg)
+                pair, _, fetched = self.scanner.refresh_market(arg)
+                pair = self.scanner.enrich_activity(arg,pair)
                 info = pair['gmgn_info']
-                if group_call:
-                    self.scanner.store.quote_call(chat, call_key, origin.get('message_id'), pair.get('priceUsd'), fetched)
                 try:
                     pair['sniper_text'] = self.scanner.current_snipers(arg)
                 except DataError:
@@ -693,7 +741,6 @@ class Bot:
                     pair['bundler_text']=self.scanner.current_tag_holdings(arg,'bundler')
                 except DataError:
                     pair['bundler_text']='Bundled —'
-                pair['call_text'] = call_text(self.scanner.store.first_call(chat, call_key), pair.get('priceUsd'))
                 return self.send_card(chat, card(arg, pair, fetched, info),
                                       self.network_keyboard(chat,arg,pair,user), self.scanner.images(arg,info))
             if action == 'sources':
@@ -710,7 +757,7 @@ class Bot:
                 return self.send(chat, holders_text(self.scanner.gmgn_query('holders', arg),chain))
             if action == 'snipers':
                 return self.send(chat, self.scanner.current_snipers(arg) +
-                                 '\nParticipación actual de las carteras etiquetadas por GMGN; no porcentaje de compras al lanzamiento. Consulta limitada a 100 carteras.\n' +
+                                 '\nParticipación actual del suministro en carteras etiquetadas. GMGN: hasta 100 carteras; Aser: solo lecturas completas y recientes. No mide las compras al lanzamiento.\n' +
                                  f'Consulta/caché de hasta 60 s · {stamp(time.time())}')
         except DataError as error:
             return self.send(chat, esc(str(error), 500))
