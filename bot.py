@@ -14,12 +14,29 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 
 ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 NA = 'No disponible'
 
 class DataError(Exception):
     pass
+
+
+class RateLimitError(DataError):
+    def __init__(self, message, retry_after=300):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def retry_delay(value):
+    seconds = number(value)
+    if seconds is None and value:
+        try:
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return max(60, seconds) if seconds is not None else 300
 
 
 def valid_address(value):
@@ -81,6 +98,9 @@ def fetch(url, payload=None, timeout=20):
         reasons = {400: 'petición no aceptada', 401: 'autenticación requerida',
                    403: 'acceso denegado', 404: 'recurso no encontrado',
                    429: 'límite de consultas alcanzado'}
+        if error.code == 429:
+            delay = retry_delay((error.headers or {}).get('Retry-After'))
+            raise RateLimitError(f'{provider}: HTTP 429 — límite de consultas alcanzado.', delay) from None
         reason = reasons.get(error.code, 'error del servicio')
         raise DataError(f'{provider}: HTTP {error.code} — {reason}.') from None
     except (TimeoutError, urllib.error.URLError, OSError):
@@ -138,18 +158,30 @@ class Scanner:
         self.gmgn_blocked_until = 0
 
     def market(self, mint):
-        if not valid_address(mint):
-            raise DataError('Contrato Solana inválido. Pega la dirección completa.')
-        key = ('market', mint)
-        if key in self.cache and time.time() - self.cache[key][0] < 30:
-            return self.cache[key][1]
-        rows = self.transport(f'https://api.dexscreener.com/token-pairs/v1/solana/{mint}')
-        pair, pairs = select_pair(rows, mint)
-        fetched = time.time()
-        self.store.save(mint, pair, fetched)
-        result = (pair, pairs, fetched)
-        self.cache[key] = (fetched, result)
-        return result
+        info = self.gmgn_query('info', mint)
+        if info.get('address') != mint:
+            raise DataError('GMGN no confirmó el contrato solicitado.')
+        price = info.get('price') if isinstance(info.get('price'), dict) else {}
+        pool = info.get('pool') if isinstance(info.get('pool'), dict) else {}
+        current = number(price.get('price'))
+        def product(supply):
+            value = number(supply)
+            return current * value if current is not None and current >= 0 and value is not None and value >= 0 else None
+        changes = {}
+        for field, window in [('m5', '5m'), ('h1', '1h'), ('h24', '24h')]:
+            old = number(price.get('price_' + window))
+            changes[field] = (current / old - 1) * 100 if current is not None and old is not None and old > 0 else None
+        address = info.get('biggest_pool_address') or pool.get('pool_address')
+        pair = {'baseToken': {'name': info.get('name', 'Token'), 'symbol': info.get('symbol', '?')},
+                'pairAddress': address if valid_address(address) else None,
+                'dexId': pool.get('exchange', 'GMGN'), 'priceUsd': current,
+                'marketCap': product(info.get('circulating_supply')), 'fdv': product(info.get('total_supply')),
+                'liquidity': {'usd': info.get('liquidity') if info.get('liquidity') is not None else pool.get('liquidity')},
+                'volume': {'h24': price.get('volume_24h')}, 'priceChange': changes,
+                'txns': {'h24': {'buys': price.get('buys_24h'), 'sells': price.get('sells_24h')}},
+                'gmgn_info': info}
+        fetched = self.cache.get(('gmgn', 'info', mint), (time.time(),))[0]
+        return pair, [pair], fetched
 
     def gmgn_query(self, command, mint):
         if not valid_address(mint):
@@ -187,46 +219,20 @@ class Scanner:
         return data
 
     def history(self, mint):
-        pair, pairs, _ = self.market(mint)
-        key = ('history', mint)
-        if key in self.cache and time.time() - self.cache[key][0] < 300:
-            return self.cache[key][1]
-        # Deliberately bounded free lookup. Never certify this result as a lifetime ATH.
-        url = (f'https://api.geckoterminal.com/api/v2/networks/solana/pools/{pair["pairAddress"]}'
-               f'/ohlcv/day?aggregate=1&limit=1000&currency=usd&token={mint}')
-        data = self.transport(url)
-        meta = data.get('meta') or {}
-        if mint not in ((meta.get('base') or {}).get('address'), (meta.get('quote') or {}).get('address')):
-            raise DataError('No se pudo confirmar el token del historial. Máximo no calculado.')
-        rows = ((data.get('data') or {}).get('attributes') or {}).get('ohlcv_list')
-        if not isinstance(rows, list):
-            raise DataError('Historial no disponible.')
-        candles = []
-        for row in rows:
-            if not isinstance(row, list) or len(row) < 6:
-                continue
-            vals = [number(v) for v in row[:6]]
-            if any(v is None for v in vals):
-                continue
-            t, o, high, low, close, volume = vals
-            if 0 < t <= time.time() and high >= max(o, close) and 0 <= low <= min(o, close) and high > 0 and volume > 0:
-                candles.append(vals)
-        if not candles:
-            raise DataError('No hay velas válidas con operaciones para calcular un máximo.')
-        peak = max(candles, key=lambda r: r[2])
-        result = (f'<b>Máximo del historial disponible · precio USD</b>\n'
-                  f'{fmt(peak[2], money=True)} · vela diaria {stamp(peak[0])}\n'
-                  f'Período recibido: {stamp(min(r[0] for r in candles))} — {stamp(max(r[0] for r in candles))}\n'
-                  f'{len(candles)} velas con volumen. Fuente: GeckoTerminal.\n'
-                  f'Par: <code>{pair["pairAddress"]}</code>\n\n'
-                  '<b>ATH histórico: sin verificar.</b> Consulta limitada a un par y una página de hasta 1.000 velas. '
-                  'No cubre necesariamente lanzamiento, otros mercados ni migraciones. '
-                  'El pico no se ha contrastado con operaciones individuales. '
-                  'La fecha corresponde al inicio de la vela, no al instante exacto.\n'
-                  'ATH de capitalización: no calculado; falta suministro circulante histórico.\n'
-                  f'Consultado: {stamp(time.time())}')
-        self.cache[key] = (time.time(), result)
-        return result
+        pair, _, fetched = self.market(mint)
+        info = pair['gmgn_info']
+        ath = number(info.get('ath_price'))
+        current = number(pair.get('priceUsd'))
+        if ath is None or ath <= 0:
+            return ('<b>ATH de precio · GMGN</b>\nNo disponible en la respuesta de GMGN.\n'
+                    'ATH histórico sin verificar. No se calcula con el suministro actual.')
+        if current is not None and ath < current:
+            return '<b>ATH de precio · GMGN</b>\nDato inconsistente: inferior al precio actual. ATH sin verificar.'
+        return (f'<b>ATH de precio reportado por GMGN</b>\n{fmt(ath, money=True)}\n\n'
+                'Fecha del ATH: no disponible en este campo.\n'
+                'ATH de capitalización: no disponible.\n'
+                'Dato del proveedor, sin contraste independiente de todo el historial.\n'
+                f'Consulta: {stamp(fetched)}')
 
 
 def keyboard(mint, pair, preference='dexscreener'):
@@ -235,7 +241,7 @@ def keyboard(mint, pair, preference='dexscreener'):
     labels = {'dexscreener': '📊 DexScreener', 'dextools': '📈 DEXTools'}
     order = [preference, 'dextools' if preference == 'dexscreener' else 'dexscreener']
     return {'inline_keyboard': [
-        [{'text': labels[k] + (' ★' if k == preference else ''), 'url': urls[k]} for k in order],
+        [({'text': labels[k] + (' ★' if k == preference else ''), 'url': urls[k]} if valid_address(pair) else {'text': labels[k], 'callback_data': 'missingpool'}) for k in order],
         [{'text': '🫧 Bubble Maps', 'url': f'https://app.bubblemaps.io/sol/token/{mint}'},
          {'text': '👥 Top holders', 'callback_data': f'holders:{mint}'}],
         [{'text': '🎯 Snipers', 'callback_data': f'snipers:{mint}'},
@@ -266,11 +272,20 @@ def change(value):
     return ('🟢 +' if n > 0 else '🔴 ' if n < 0 else '') + f'{n:.2f}'.rstrip('0').rstrip('.') + '%'
 
 
-def card(mint, pair, fetched, info=None, gmgn_note='GMGN pendiente de configurar.'):
+def ath_line(info, current):
+    ath, current = number(info.get('ath_price')), number(current)
+    if ath is None or ath <= 0:
+        return '🏔 <b>ATH de precio: no disponible</b>'
+    if current is not None and ath < current:
+        return '🏔 <b>ATH de precio: dato inconsistente</b>'
+    return f'🏔 <b>ATH precio {fmt(ath, money=True)}</b> · GMGN'
+
+
+def card(mint, pair, fetched, info=None, gmgn_note=''):
     base = pair.get('baseToken') or {}
     changes = pair.get('priceChange') or {}
     tx = (pair.get('txns') or {}).get('h24') or {}
-    info = info or {}
+    info = info or pair.get('gmgn_info') or {}
     stat, tags = info.get('stat') or {}, info.get('wallet_tags_stat') or {}
     price = fmt(pair.get('priceUsd'), money=True) if number(pair.get('priceUsd')) is not None else '—'
     top = fmt(stat.get('top_10_holder_rate'), ratio=True) if number(stat.get('top_10_holder_rate')) is not None else '—'
@@ -281,23 +296,23 @@ def card(mint, pair, fetched, info=None, gmgn_note='GMGN pendiente de configurar
              f'FDV {compact(pair.get("fdv"), True)} · Vol 24h {compact((pair.get("volume") or {}).get("h24"), True)}',
              ' · '.join(f'{label} {change(changes.get(key))}' for key, label in [('m5', '5m'), ('h1', '1h'), ('h24', '24h')]),
              f'Compras {compact(tx.get("buys"))} · Ventas {compact(tx.get("sells"))} <i>(24h)</i>', '',
-             '🏔 <b>ATH histórico: sin verificar</b>',
+             ath_line(info, pair.get('priceUsd')),
              f'👥 Holders {compact(info.get("holder_count"))} · Top 10 {top}',
              f'🎯 Snipers etiquetados {compact(tags.get("sniper_wallets"))}']
     if gmgn_note:
         lines.append('<i>GMGN: datos no disponibles</i>')
     lines += ['', f'<code>{mint}</code>', '',
-              f'<i>DexScreener · Consulta {stamp(fetched)}</i>',
+              f'<i>GMGN · Consulta {stamp(fetched)}</i>',
               '<i>— Sin datos · Detalles en «Fuentes»</i>']
     return '\n'.join(lines)
 
 
 def sources_text(pair, fetched, gmgn_note=''):
     lines = ['<b>Fuentes y alcance</b>',
-             'Mercado: DexScreener. MC reportada por el proveedor; FDV es valoración diluida.',
-             'Precio, liquidez, variaciones, volumen y operaciones: par con mayor liquidez disponible. No representan todos los mercados.',
+             'Mercado: GMGN. MC = precio × suministro circulante. FDV = precio × suministro total; no se sustituye MC por FDV.',
+             'Precio y actividad: GMGN. Variaciones calculadas con sus precios al inicio de cada período. Liquidez del pool principal indicado por GMGN.',
              'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
-             'ATH histórico sin verificar: el botón ATH consulta el máximo del historial disponible, que puede ser incompleto.',
+             'ATH de precio: campo ath_price de GMGN, sin verificación independiente. No equivale al ATH de capitalización. Si falta, se indica como no disponible.',
              'Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
     created = number(pair.get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
@@ -335,7 +350,7 @@ HELP = ('<b>Veraz · versión inicial para Solana</b>\n'
         '/snipers CONTRATO — detección GMGN\n'
         '/ath CONTRATO — máximo del historial disponible\n\n'
         'Los charts se abren en el navegador. Bubble Maps depende de cobertura externa. '
-        'No certificamos un ATH si falta historial. Axiom: integración automática pendiente.')
+        'Datos: GMGN. ATH de precio reportado por el proveedor; no certificado independientemente.')
 
 
 class Bot:
@@ -383,6 +398,8 @@ class Bot:
                 action, arg = 'scan', text
             else:
                 return
+        if action == 'missingpool':
+            return self.send(chat, 'GMGN no ha devuelto un pool válido para abrir este gráfico. Puedes usar el botón GMGN.')
         if action in ('start', 'help'):
             return self.send(chat, HELP)
         if action in ('chart', 'settings'):
@@ -453,7 +470,7 @@ class Bot:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--scan', help='Consultar sin Telegram; requiere acceso a DexScreener')
+    parser.add_argument('--scan', help='Consultar sin Telegram; requiere GMGN')
     args = parser.parse_args()
     store = Store(os.environ.get('BOT_DB', 'veraz.sqlite3'))
     scanner = Scanner(store, gmgn=os.environ.get('ENABLE_GMGN') == '1')
