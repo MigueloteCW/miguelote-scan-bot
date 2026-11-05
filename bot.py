@@ -160,6 +160,15 @@ class Store:
         row=self.db.execute('SELECT value FROM state WHERE key=?',('ref:'+key,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def card_snapshot(self,chat,message_id,value=None):
+        key=f'card:{chat}:{message_id}'
+        if value is not None:
+            self.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(key,json.dumps(value)))
+            self.db.commit()
+            return
+        row=self.db.execute('SELECT value FROM state WHERE key=?',(key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
     def preference(self, user, provider=None):
         if provider is not None:
             if provider not in ('dexscreener', 'dextools'):
@@ -513,6 +522,32 @@ def activity_lines(pair,now):
             f'└ Boosts DEX: <b>{count(boosts.get("active"))}</b>']
 
 
+def comparison_snapshot(mint,pair,fetched,info):
+    return {'mint':mint,'chain':pair.get('chainId'),'source':pair.get('source'),
+            'pool':pair.get('pairAddress'),'time':fetched,'price':number(pair.get('priceUsd')),
+            'liquidity':number((pair.get('liquidity') or {}).get('usd')),
+            'holders':number(info.get('holder_count')),
+            'top10':number((info.get('stat') or {}).get('top_10_holder_rate'))}
+
+
+def comparison_text(old,new):
+    if not old or any(old.get(k)!=new.get(k) for k in ('mint','chain')):
+        return '🔄 <b>Desde la consulta anterior</b>\nComparación disponible en la próxima actualización.'
+    elapsed=max(0,int(new['time']-old['time']))
+    age=f'{elapsed}s' if elapsed<60 else f'{elapsed//60} min' if elapsed<3600 else f'{elapsed//3600}h {(elapsed%3600)//60} min'
+    comparable=old.get('source')==new.get('source') and old.get('pool')==new.get('pool')
+    def percent(key):
+        a,b=number(old.get(key)),number(new.get(key))
+        return f'{(b/a-1)*100:+.2f}%' if comparable and a is not None and a>0 and b is not None and b>=0 else '—'
+    a,b=number(old.get('holders')),number(new.get('holders'))
+    holders=f'{b-a:+.0f}' if comparable and a is not None and b is not None and min(a,b)>=0 else '—'
+    a,b=number(old.get('top10')),number(new.get('top10'))
+    top=f'{a*100:.2f}% → {b*100:.2f}%' if comparable and a is not None and b is not None and 0<=a<=1 and 0<=b<=1 else '—'
+    return (f'🔄 <b>Desde la consulta anterior · {age}</b>\n'
+            f'Precio: {percent("price")}\nLiquidez: {percent("liquidity")}\n'
+            f'Holders: {holders}\nTop 10: {top}')
+
+
 def card(mint, pair, fetched, info=None, gmgn_note=''):
     base=pair.get('baseToken') or {}
     info=info or pair.get('gmgn_info') or {}
@@ -565,7 +600,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
               f'DEV: <code>{short(dev.get("creator_address"))}</code>',
               '',f'<code>{mint}</code>',
               '<i>🔄 Última consulta: '+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</i>']
-    return '\n'.join(lines)
+    return '\n'.join(line for line in lines if line)
 
 
 def sources_text(pair, fetched, gmgn_note=''):
@@ -575,6 +610,7 @@ def sources_text(pair, fetched, gmgn_note=''):
              'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
              'ATH de precio: reportado por GMGN. MC al precio ATH marcado ≈ es una estimación con suministro circulante actual, no el MC histórico. Snipers: suma de participaciones de holders etiquetados por GMGN, consulta limitada a 100 carteras; una lista de 100 es parcial.',
              'Actividad del par: C/V son cantidades de compras/ventas, no dólares ni personas únicas. Ventanas 5m y 1h, edad del par y boosts: DexScreener, solo para el mismo pool y red. Boosts son promoción, no garantía de calidad. LIQ/MC = liquidez / capitalización × 100; VOL/LIQ = volumen 24h / liquidez. Son relaciones descriptivas, no medidas de seguridad.',
+             'Desde la consulta anterior compara la última ficha enviada o editada con éxito en ese mensaje. Si el servidor pierde el registro local, la comparación comienza en la siguiente actualización. Cambios de proveedor o pool se muestran como — para no mezclar referencias.',
              'Edad: fecha de creación del token según GMGN; no se sustituye por la edad del pool. Equipo: suministro en carteras etiquetadas como equipo. No se calcula una puntuación de auditoría ni se equipara volumen de bundlers con suministro retenido. Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
     created = number(pair.get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
@@ -831,10 +867,20 @@ class Bot:
                     pair['bundler_text']=self.scanner.current_tag_holdings(arg,'bundler')
                 except DataError:
                     pair['bundler_text']='Bundled —'
+                current=comparison_snapshot(arg,pair,fetched,info)
+                text=card(arg,pair,fetched,info)
+                markup=self.network_keyboard(chat,arg,pair,user)
                 if refreshing:
-                    return self.edit_card(msg,card(arg,pair,fetched,info),self.network_keyboard(chat,arg,pair,user))
-                return self.send_card(chat, card(arg, pair, fetched, info),
-                                      self.network_keyboard(chat,arg,pair,user), self.scanner.images(arg,info))
+                    previous=self.scanner.store.card_snapshot(chat,msg['message_id'])
+                    text+='\n'+comparison_text(previous,current)
+                    result=self.edit_card(msg,text,markup)
+                    if result:
+                        self.scanner.store.card_snapshot(chat,msg['message_id'],current)
+                    return result
+                result=self.send_card(chat,text,markup,self.scanner.images(arg,info))
+                if isinstance(result,dict) and result.get('message_id'):
+                    self.scanner.store.card_snapshot(chat,result['message_id'],current)
+                return result
             if action == 'sources':
                 pair, _, fetched = self.scanner.market(arg)
                 note = ''
