@@ -339,12 +339,13 @@ class Scanner:
         fetched = self.cache.get(('gmgn', self.chain, 'info', normalized(mint)), (time.time(),))[0]
         return pair, [pair], fetched
 
-    def gmgn_query(self, command, mint):
+    def gmgn_query(self, command, mint, wallet=None):
         if not valid_contract(mint) or self.chain not in GMGN_CHAINS:
             raise DataError('Sin cobertura de GMGN para esta red.')
         if not self.gmgn:
             raise DataError('GMGN pendiente de configurar: hace falta su clave API de consulta.')
-        key = ('gmgn', self.chain, command, normalized(mint))
+        if command=='dev_sales' and not valid_contract(wallet):raise DataError('Cartera DEV no identificada.')
+        key = ('gmgn', self.chain, command, normalized(wallet), normalized(mint)) if command=='dev_sales' else ('gmgn', self.chain, command, normalized(mint))
         if key in self.cache and time.time() - self.cache[key][0] < 60:
             return self.cache[key][1]
         if time.time() < self.gmgn_blocked_until:
@@ -352,6 +353,8 @@ class Scanner:
         if not shutil.which('gmgn-cli'):
             raise DataError('Falta instalar gmgn-cli en el equipo del bot.')
         args = ['gmgn-cli', 'token', 'holders' if command in ('sniper_holders','bundler_holders') else command, '--chain', GMGN_CHAINS[self.chain], '--address', mint, '--raw']
+        if command=='dev_sales':
+            args=['gmgn-cli','portfolio','activity','--chain',GMGN_CHAINS[self.chain],'--wallet',wallet,'--token',mint,'--type','sell','--limit','1','--raw']
         if command in ('sniper_holders','bundler_holders'):
             args += ['--tag', 'sniper' if command=='sniper_holders' else 'bundler', '--limit', '100', '--order-by', 'amount_percentage', '--direction', 'desc']
         if command == 'holders':
@@ -379,6 +382,26 @@ class Scanner:
             raise DataError('GMGN no disponible. Pausa de 5 minutos.') from None
         self.cache[key] = (time.time(), data)
         return data
+
+    def dev_sell(self,mint,info):
+        dev=info.get('dev') if isinstance(info.get('dev'),dict) else {}
+        creator=dev.get('creator_address')
+        if not valid_contract(creator):return '⚪ Sin verificar'
+        # Only the documented token-info "sell" status indicates a sale.
+        # "hold", zero balance and "creator_close" do not prove absence/presence of sales.
+        if dev.get('creator_token_status')=='sell':return '🔴 Sí'
+        try:data=self.gmgn_query('dev_sales',mint,wallet=creator)
+        except DataError:return '⚪ Sin verificar'
+        rows=data.get('activities')
+        if not isinstance(rows,list):return '⚪ Sin verificar'
+        for row in rows:
+            if not isinstance(row,dict):continue
+            token=row.get('token') or {}
+            if isinstance(token,dict) and same_token(token.get('address'),mint) and (row.get('event_type') or row.get('type'))=='sell' and row.get('tx_hash'):
+                return '🔴 Sí'
+        if not rows and 'next' in data and data['next'] in (None,''):
+            return '🟢 No detectado'
+        return '⚪ Sin verificar'
 
     def current_snipers(self, mint):
         try:return self.current_tag_holdings(mint,'sniper')
@@ -598,6 +621,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
               f'└ Equipo: {ratio(stat.get("dev_team_hold_rate"))}',
               '', f'P: <code>{short(pair.get("pairAddress"))}</code>',
               f'DEV: <code>{short(dev.get("creator_address"))}</code>',
+              'DEV SELL: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>',
               '',f'<code>{mint}</code>',
               '<i>🔄 Última consulta: '+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</i>']
     return '\n'.join(line for line in lines if line)
@@ -610,6 +634,7 @@ def sources_text(pair, fetched, gmgn_note=''):
              'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
              'ATH de precio: reportado por GMGN. MC al precio ATH marcado ≈ es una estimación con suministro circulante actual, no el MC histórico. Snipers: suma de participaciones de holders etiquetados por GMGN, consulta limitada a 100 carteras; una lista de 100 es parcial.',
              'Actividad del par: C/V son cantidades de compras/ventas, no dólares ni personas únicas. Ventanas 5m y 1h, edad del par y boosts: DexScreener, solo para el mismo pool y red. Boosts son promoción, no garantía de calidad. LIQ/MC = liquidez / capitalización × 100; VOL/LIQ = volumen 24h / liquidez. Son relaciones descriptivas, no medidas de seguridad.',
+             'DEV SELL: cartera creadora identificada por GMGN. Sí indica estado sell en token info o una venta del token en su historial de actividad. No detectado indica que la consulta filtrada por ventas devuelve una lista vacía sin más páginas; no certifica que nunca vendió ni cubre otras carteras del equipo, transferencias o ventas fuera del historial del proveedor. No es una valoración de seguridad. Sin verificar significa que faltan datos o no se pudo consultar.',
              'Desde la consulta anterior compara la última ficha enviada o editada con éxito en ese mensaje. Si el servidor pierde el registro local, la comparación comienza en la siguiente actualización. Cambios de proveedor o pool se muestran como — para no mezclar referencias.',
              'Edad: fecha de creación del token según GMGN; no se sustituye por la edad del pool. Equipo: suministro en carteras etiquetadas como equipo. No se calcula una puntuación de auditoría ni se equipara volumen de bundlers con suministro retenido. Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
     created = number(pair.get('pairCreatedAt'))
@@ -867,6 +892,7 @@ class Bot:
                     pair['bundler_text']=self.scanner.current_tag_holdings(arg,'bundler')
                 except DataError:
                     pair['bundler_text']='Bundled —'
+                pair['dev_sell_text']=self.scanner.dev_sell(arg,info)
                 current=comparison_snapshot(arg,pair,fetched,info)
                 text=card(arg,pair,fetched,info)
                 markup=self.network_keyboard(chat,arg,pair,user)
