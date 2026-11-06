@@ -729,12 +729,25 @@ def security_text(mint,chain,sources,market=None):
               '<i>Escáner de riesgos, no auditoría ni consejo de inversión. Si faltan datos, NO implica seguridad.</i>']
     return '\n'.join(lines)
 
+def aser_first_signal(data):
+    rows=data.get('signals') or []
+    if not rows:return None
+    # Do not guess chronology when any timestamp is absent/invalid.
+    if any(number(r.get('time')) is None or not 0<number(r['time'])<=time.time()*1000+60000 for r in rows):
+        return rows[0] if len(rows)==1 else None
+    return min(rows,key=lambda r:number(r['time']))
+
+
 def aser_summary(data):
     if not data:return ''
     ns,nt=len(data['signals']),len(data['theses'])
     if not ns and not nt:return ''
     parts=[]
-    if ns:parts.append(str(ns)+' señal'+('es' if ns!=1 else ''))
+    if ns:
+        first=aser_first_signal(data)
+        mc=number(first.get('mcap_usd')) if first else None
+        value=compact(mc,True) if mc is not None and mc>=0 else '—'
+        parts.append(str(ns)+' señal'+('es' if ns!=1 else '')+' · 1ª call MC '+value)
     if nt:parts.append(str(nt)+' mención'+('es' if nt!=1 else '')+' comunidad')
     return '📡 <b>ASER</b>: '+' · '.join(parts)
 
@@ -746,6 +759,13 @@ def aser_report(mint,data):
         return n if n is not None and 0<n<=time.time()*1000+60000 else 0
     signals=sorted(data['signals'],key=when,reverse=True)
     theses=sorted(data['theses'],key=when,reverse=True)
+    first=aser_first_signal(data)
+    if first:
+        mc=number(first.get('mcap_usd'))
+        lines+=['','<b>Primera señal registrada por ASER</b>', 'MC: '+(compact(mc,True) if mc is not None and mc>=0 else '—')]
+        if when(first):lines.append(stamp(when(first)/1000))
+        lines.append(esc(' '.join(str(first.get('title') or first.get('kind') or 'Señal').split()),100))
+        if first.get('approved') is False:lines.append('⚠️ No pasó el filtro de ASER.')
     lines+=['','<b>Señales de ASER</b>']
     if not signals:lines.append('Sin señales en el historial devuelto.')
     for row in signals[:3]:
@@ -780,7 +800,7 @@ def keyboard(mint, pair, preference='dexscreener'):
          {'text': '🏔 ATH', 'callback_data': f'ath:{mint}'}],
         [{'text': 'GMGN', 'url': f'https://gmgn.ai/sol/token/{mint}'},
          {'text': 'Solscan', 'url': f'https://solscan.io/token/{mint}'}],
-        [{'text': '🔍 SCAN Seguridad', 'callback_data': f'security:{mint}'}],
+        [{'text': '🔍 Escáner', 'callback_data': f'security:{mint}'}],
         [{'text': '🔄 Actualizar', 'callback_data': f'scan:{mint}'},
          {'text': 'ℹ Fuentes', 'callback_data': f'sources:{mint}'}],
     ]}
@@ -961,7 +981,7 @@ def sources_text(pair, fetched, gmgn_note=''):
              'DEV SELL: cartera creadora identificada por GMGN. Sí indica estado sell en token info o una venta del token en su historial de actividad. No detectado indica que la consulta filtrada por ventas devuelve una lista vacía sin más páginas; no certifica que nunca vendió ni cubre otras carteras del equipo, transferencias o ventas fuera del historial del proveedor. No es una valoración de seguridad. Sin verificar significa que faltan datos o no se pudo consultar.',
              'Desde la consulta anterior compara la última ficha enviada o editada con éxito en ese mensaje. Si el servidor pierde el registro local, la comparación comienza en la siguiente actualización. Cambios de proveedor o pool se muestran como — para no mezclar referencias.',
              'Edad: fecha de creación del token según GMGN; no se sustituye por la edad del pool. Equipo: suministro en carteras etiquetadas como equipo. No se calcula una puntuación de auditoría ni se equipara volumen de bundlers con suministro retenido. Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
-    lines.append('ASER: señales y tesis devueltas para el contrato exacto en Solana. Las tesis son opiniones de usuarios, no señales oficiales. La ficha resume el historial devuelto, no garantiza cobertura completa. Si falta espacio bajo la imagen, el resumen queda en el botón ASER. Caché de hasta 60 segundos; Actualizar renueva la consulta salvo pausa por errores o cuota.')
+    lines.append('ASER: señales y tesis devueltas para el contrato exacto en Solana. Las tesis son opiniones de usuarios, no señales oficiales. La primera call es la señal más antigua del historial devuelto por ASER, no la primera publicación del grupo ni una garantía de cobertura histórica completa. No implica que fuera una recomendación de compra. Si falta espacio bajo la imagen, el resumen queda en el botón ASER. Caché de hasta 60 segundos; Actualizar renueva la consulta salvo pausa por errores o cuota.')
     created = number(pair.get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
         lines.append(f'Creación del par (no del token): {stamp(created / 1000)}')
@@ -1068,10 +1088,7 @@ class Bot:
                     direct='refresh:'+chain+':'+mint
                     button['callback_data']=direct if verb=='scan' and len(direct.encode())<=64 else verb+':'+data
         if chain=='solana':
-            data_aser=pair.get('aser_signals')
             label='📡 ASER'
-            if data_aser is not None:
-                label+=' · '+str(len(data_aser['signals']))+' señales'
             markup['inline_keyboard'][4].append({'text':label,'callback_data':'aser:'+data})
             return markup
         q=urllib.parse.quote
