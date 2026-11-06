@@ -944,7 +944,8 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     text='\n'.join(line for line in lines if line)
     summary=aser_summary(pair.get('aser_signals'))
     if summary:
-        extended=text+'\n'+summary
+        position=next(i for i,line in enumerate(lines) if line.startswith('P: <code>'))
+        extended='\n'.join(line for line in lines[:position]+[summary]+lines[position:] if line)
         visible=html.unescape(re.sub(r'<[^>]+>','',extended))
         if len(visible.encode('utf-16-le'))//2<=1024:text=extended
     return text
