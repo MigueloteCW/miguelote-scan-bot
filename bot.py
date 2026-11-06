@@ -714,7 +714,6 @@ def keyboard(mint, pair, preference='dexscreener'):
         [{'text': '🔍 SCAN Seguridad', 'callback_data': f'security:{mint}'}],
         [{'text': '🔄 Actualizar', 'callback_data': f'scan:{mint}'},
          {'text': 'ℹ Fuentes', 'callback_data': f'sources:{mint}'}],
-        [{'text': '⚙ Elegir gráfico', 'callback_data': 'settings'}]
     ]}
 
 
@@ -789,11 +788,8 @@ def activity_lines(pair,now):
     created=number(extra.get('pairCreatedAt'))
     age=age_text(created/1000 if created else None,now)
     return ['', '⚡ <b>Actividad del par</b>',
-            f'├ C/V 5m: <b>{transactions("m5")}</b>',
-            f'├ C/V 1h: <b>{transactions("h1")}</b>',
             f'├ LIQ/MC: <b>{liquidity_ratio}</b>',
             f'├ VOL/LIQ 24h: <b>{turnover}</b>',
-            f'├ Edad del par: <b>{age}</b>',
             f'└ Boosts DEX: <b>{count(boosts.get("active"))}</b>']
 
 
@@ -953,7 +949,8 @@ class Bot:
             if not isinstance(logo,str) or not logo.startswith('https://') or len(logo)>=2048:
                 continue
             payload = {'chat_id': chat, 'photo': logo}
-            fits = len(text.encode('utf-16-le')) // 2 <= 1024
+            visible = html.unescape(re.sub(r'<[^>]+>', '', text))
+            fits = len(visible.encode('utf-16-le')) // 2 <= 1024
             if fits:
                 payload.update(caption=text, parse_mode='HTML', reply_markup=markup)
             try:
