@@ -321,6 +321,37 @@ class Scanner:
             self.cache[key]=(time.time(),None)
             raise DataError('Aser no disponible.') from None
 
+    def aser_signals(self, mint):
+        if self.chain!='solana':
+            raise DataError('ASER: señales disponibles solo para Solana.')
+        api_key=os.environ.get('ASER_API_KEY','').strip()
+        if not api_key:
+            raise DataError('ASER: falta configurar ASER_API_KEY en Render.')
+        if not valid_address(mint):raise DataError('Contrato Solana no válido.')
+        key=('aser','signals',mint)
+        cached=self.cache.get(key)
+        if cached and time.time()-cached[0]<60:return cached[1]
+        if time.time()<self.cache.get(('aser_signals_pause',),0):
+            raise DataError('ASER: consulta temporalmente no disponible.')
+        url='https://aser.trade/aser/api/v1/signals/'+urllib.parse.quote(mint,safe='')
+        try:
+            data=self.transport(url,timeout=6,extra_headers={'Authorization':'Bearer '+api_key})
+            if not isinstance(data,dict) or data.get('mint')!=mint:
+                raise DataError('ASER no confirmó el contrato solicitado.')
+            for field in ('signals','theses'):
+                if not isinstance(data.get(field),list) or any(not isinstance(row,dict) for row in data[field]):
+                    raise DataError('ASER devolvió un historial incompleto.')
+                for row in data[field]:
+                    if row.get('mint') not in (None,mint):raise DataError('ASER devolvió otro contrato.')
+            self.cache[key]=(time.time(),data)
+            return data
+        except RateLimitError as error:
+            self.cache[('aser_signals_pause',)]=time.time()+max(60,error.retry_after)
+            raise DataError('ASER: límite de consultas; se reintentará más tarde.') from None
+        except DataError:
+            self.cache[('aser_signals_pause',)]=time.time()+60
+            raise
+
     def aser_snipers(self,mint):
         data=self.aser(mint,live=True)
         ledger=data.get('holders') or {}
@@ -698,6 +729,44 @@ def security_text(mint,chain,sources,market=None):
               '<i>Escáner de riesgos, no auditoría ni consejo de inversión. Si faltan datos, NO implica seguridad.</i>']
     return '\n'.join(lines)
 
+def aser_summary(data):
+    if not data:return ''
+    ns,nt=len(data['signals']),len(data['theses'])
+    if not ns and not nt:return ''
+    parts=[]
+    if ns:parts.append(str(ns)+' señal'+('es' if ns!=1 else ''))
+    if nt:parts.append(str(nt)+' mención'+('es' if nt!=1 else '')+' comunidad')
+    return '📡 <b>ASER</b>: '+' · '.join(parts)
+
+
+def aser_report(mint,data):
+    lines=['📡 <b>ASER · Señales y comunidad</b>','Solana · '+f'<code>{mint}</code>']
+    def when(row):
+        n=number(row.get('time'))
+        return n if n is not None and 0<n<=time.time()*1000+60000 else 0
+    signals=sorted(data['signals'],key=when,reverse=True)
+    theses=sorted(data['theses'],key=when,reverse=True)
+    lines+=['','<b>Señales de ASER</b>']
+    if not signals:lines.append('Sin señales en el historial devuelto.')
+    for row in signals[:3]:
+        title=' '.join(str(row.get('title') or row.get('kind') or 'Señal').split())
+        lines.append('• '+esc(title,100))
+        if when(row):lines.append(stamp(when(row)/1000))
+        price,mc=number(row.get('price_usd')),number(row.get('mcap_usd'))
+        lines.append('Precio: '+(fmt(price,True) if price is not None and price>=0 else '—')+' · MC: '+(compact(mc,True) if mc is not None and mc>=0 else '—'))
+        if row.get('approved') is False:lines.append('⚠️ No pasó el filtro de ASER.')
+    lines+=['','<b>Menciones de la comunidad</b>']
+    if not theses:lines.append('Sin menciones en el historial devuelto.')
+    for row in theses[:2]:
+        author=row.get('author') if isinstance(row.get('author'),dict) else {}
+        lines.append('• '+esc(author.get('alias') or 'Usuario',40)+': '+esc(' '.join(str(row.get('text') or '').split()),180))
+        if when(row):lines.append(stamp(when(row)/1000))
+    lines+=['','Mostradas hasta 3 señales y 2 menciones recientes.',
+            'Las señales pueden ser avisos positivos o negativos. Las menciones son opiniones de usuarios.',
+            '<i>Consulta: '+stamp(time.time())+'</i>']
+    return '\n'.join(lines)
+
+
 def keyboard(mint, pair, preference='dexscreener'):
     urls = {'dexscreener': f'https://dexscreener.com/solana/{pair}',
             'dextools': f'https://www.dextools.io/app/en/solana/pair-explorer/{pair}'}
@@ -872,7 +941,13 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
               'DEV SELL: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>',
               '',f'<code>{mint}</code>',
               '<i>🔄 Última consulta: '+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</i>']
-    return '\n'.join(line for line in lines if line)
+    text='\n'.join(line for line in lines if line)
+    summary=aser_summary(pair.get('aser_signals'))
+    if summary:
+        extended=text+'\n'+summary
+        visible=html.unescape(re.sub(r'<[^>]+>','',extended))
+        if len(visible.encode('utf-16-le'))//2<=1024:text=extended
+    return text
 
 
 def sources_text(pair, fetched, gmgn_note=''):
@@ -885,6 +960,7 @@ def sources_text(pair, fetched, gmgn_note=''):
              'DEV SELL: cartera creadora identificada por GMGN. Sí indica estado sell en token info o una venta del token en su historial de actividad. No detectado indica que la consulta filtrada por ventas devuelve una lista vacía sin más páginas; no certifica que nunca vendió ni cubre otras carteras del equipo, transferencias o ventas fuera del historial del proveedor. No es una valoración de seguridad. Sin verificar significa que faltan datos o no se pudo consultar.',
              'Desde la consulta anterior compara la última ficha enviada o editada con éxito en ese mensaje. Si el servidor pierde el registro local, la comparación comienza en la siguiente actualización. Cambios de proveedor o pool se muestran como — para no mezclar referencias.',
              'Edad: fecha de creación del token según GMGN; no se sustituye por la edad del pool. Equipo: suministro en carteras etiquetadas como equipo. No se calcula una puntuación de auditoría ni se equipara volumen de bundlers con suministro retenido. Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
+    lines.append('ASER: señales y tesis devueltas para el contrato exacto en Solana. Las tesis son opiniones de usuarios, no señales oficiales. La ficha resume el historial devuelto, no garantiza cobertura completa. Si falta espacio bajo la imagen, el resumen queda en el botón ASER. Caché de hasta 60 segundos; Actualizar renueva la consulta salvo pausa por errores o cuota.')
     created = number(pair.get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
         lines.append(f'Creación del par (no del token): {stamp(created / 1000)}')
@@ -991,6 +1067,11 @@ class Bot:
                     direct='refresh:'+chain+':'+mint
                     button['callback_data']=direct if verb=='scan' and len(direct.encode())<=64 else verb+':'+data
         if chain=='solana':
+            data_aser=pair.get('aser_signals')
+            label='📡 ASER'
+            if data_aser is not None:
+                label+=' · '+str(len(data_aser['signals']))+' señales'
+            markup['inline_keyboard'][4].append({'text':label,'callback_data':'aser:'+data})
             return markup
         q=urllib.parse.quote
         pool=pair.get('pairAddress')
@@ -1079,12 +1160,12 @@ class Bot:
                 self.scanner.store.preference(user, arg)
                 return self.send(chat, 'Preferencia guardada para tus próximas consultas.')
             return
-        if action not in ('scan', 'ath', 'holders', 'snipers', 'sources', 'security', 'srefresh'):
+        if action not in ('scan', 'ath', 'holders', 'snipers', 'sources', 'security', 'srefresh', 'aser'):
             return self.send(chat, HELP)
         chain = None
         if arg.startswith('ref_'):
             ref=self.scanner.store.reference(key=arg[4:])
-            if not ref and (refreshing or action in ('security','srefresh')):
+            if not ref and (refreshing or action in ('security','srefresh','aser')):
                 # Old buttons refer to local state, which Render may discard on restart.
                 body=msg.get('text') or msg.get('caption') or ''
                 addresses=[line.strip() for line in body.splitlines() if valid_contract(line.strip())]
@@ -1143,6 +1224,9 @@ class Bot:
                 except DataError:
                     pair['bundler_text']='Bundled —'
                 pair['dev_sell_text']=self.scanner.dev_sell(arg,info)
+                if chain=='solana':
+                    try:pair['aser_signals']=self.scanner.aser_signals(arg)
+                    except DataError:pass
                 current=comparison_snapshot(arg,pair,fetched,info)
                 text=card(arg,pair,fetched,info)
                 markup=self.network_keyboard(chat,arg,pair,user)
@@ -1157,6 +1241,9 @@ class Bot:
                 if isinstance(result,dict) and result.get('message_id'):
                     self.scanner.store.card_snapshot(chat,result['message_id'],current)
                 return result
+            if action=='aser':
+                data=self.scanner.aser_signals(arg)
+                return self.send(chat,aser_report(arg,data),{'inline_keyboard':[[{'text':'Abrir ASER','url':'https://aser.trade/#/coin/'+arg}]]})
             if action in ('security','srefresh'):
                 sources=self.scanner.security_evidence(chain,arg,deep=True,force=action=='srefresh')
                 try:
@@ -1236,3 +1323,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
