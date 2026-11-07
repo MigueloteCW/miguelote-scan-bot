@@ -821,11 +821,12 @@ def security_text(mint,chain,sources,market=None):
     tax=tax_details(chain,sources)
     lines=['🔍 <b>MIGUELOTE SCAN · SEGURIDAD</b>',
            f'Red: <b>{esc(chain.upper())}</b>',f'<code>{esc(mint,96)}</code>','',
-           '🛡️ <b>Audit automático · índice heurístico</b>']
+           '🛡️ <b>AUDIT · índice SCAN (0–100)</b>']
     if result['score'] is None:
         lines.append('Puntuación: — · '+result['verdict'])
     else:
-        lines.append(f'Puntuación parcial: <b>{result["score"]}/100</b> · {result["verdict"]}')
+        lines.append(f'Índice SCAN: <b>{result["score"]}/100</b> · {result["verdict"]}')
+    lines += ['Índice calculado por Miguelote Scan con las comprobaciones recibidas; no es una nota del proveedor. Verde: 70–100; naranja: 40–69; rojo: 0–39. —: sin datos suficientes para puntuar.']
     lines += ['', '🧾 <b>Impuestos/comisiones del token</b>']
     if chain=='solana':
         lines.append('Compra / venta: — (no inferible con estas fuentes)')
@@ -1083,17 +1084,16 @@ def comparison_text(old,new):
 
 def audit_summary(chain,sources,market=None):
     result=security_assessment(chain,sources,market)
-    status={
-        'RIESGO CRÍTICO':'🔴 Crítico',
-        'RIESGO ALTO':'🔴 Alto',
-        'PRECAUCIÓN':'🟠 Precaución',
-        'ANÁLISIS PARCIAL':'🟡 Parcial',
-        'SIN DATOS SUFICIENTES':'⚪ Sin datos',
-        'SIN ALERTAS CRÍTICAS DETECTADAS':'🟢 Sin alertas críticas',
-    }[result['verdict']]
-    if result['coverage']=='parcial' and result['verdict'] in ('RIESGO CRÍTICO','RIESGO ALTO','PRECAUCIÓN'):
-        status+=' · parcial'
-    return '🛡️ <b>Audit automático</b>: '+status
+    providers=[name for name in ('GoPlus','Honeypot.is','RugCheck') if sources.get(name)]
+    label=' + '.join(providers) if providers else 'SCAN'
+    score=result['score'] if providers else None
+    if score is None:
+        value='⚪ —'
+    else:
+        color='🟢' if score>=70 else '🟠' if score>=40 else '🔴'
+        value=f'{color} <b>{score}/100</b>'
+        if result['verdict']=='RIESGO CRÍTICO':value+=' · ⚠️ Crítico'
+    return '🛡️ <b>AUDIT '+label+'</b>: '+value+' · índice SCAN'
 
 
 def card(mint, pair, fetched, info=None, gmgn_note=''):
@@ -1123,7 +1123,13 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
            f'├ B/S: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24h)',
            f'└ HLD: <b>{compact(info.get("holder_count"))}</b>', '',
            '🏔 <b>ATH</b>']
-    lines=lines[:-2]
+    if ath is not None and ath>0 and (current is None or current<=ath):
+        lines += [f'├ Precio: <b>{fmt(ath,money=True)}</b>',f'├ {ath_mc(info)}']
+        drop=(current/ath-1)*100 if current is not None else None
+        lines += [f'└ Desde ATH: {change(drop)}']
+    else:
+        lines += ['└ —']
+    lines+=activity_lines(pair,fetched)
     lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), tax_line(chain,pair.get('security_sources') or {}), '🟦 <b>Distribución</b>',
               f'👥 Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
               '🎯 '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
@@ -1132,13 +1138,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
               '', f'P: <code>{short(pair.get("pairAddress"))}</code>',
               f'DEV: <code>{short(dev.get("creator_address"))}</code>',
               'DEV SELL: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>']
-    lines+=activity_lines(pair,fetched)+['','🏔 <b>ATH</b>']
-    if ath is not None and ath>0 and (current is None or current<=ath):
-        lines += [f'├ Precio: <b>{fmt(ath,money=True)}</b>',f'├ {ath_mc(info)}']
-        drop=(current/ath-1)*100 if current is not None else None
-        lines += [f'└ Desde ATH: {change(drop)}']
-    else:
-        lines += ['└ —']
+    aser_position=len(lines)
     social=info.get('link') or {}
     links=[]
     for label,key in [('Web','website'),('TG','telegram'),('Discord','discord')]:
@@ -1152,7 +1152,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     text='\n'.join(line for line in lines if line)
     summary=aser_summary(pair.get('aser_signals'))
     if summary:
-        position=len(lines)-2
+        position=aser_position
         extended='\n'.join(line for line in lines[:position]+[summary]+lines[position:] if line)
         visible=html.unescape(re.sub(r'<[^>]+>','',extended))
         if len(visible.encode('utf-16-le'))//2<=1024:text=extended
@@ -1451,7 +1451,7 @@ class Bot:
                 markup=self.network_keyboard(chat,arg,pair,user)
                 if refreshing:
                     previous=self.scanner.store.card_snapshot(chat,msg['message_id'])
-                    text=text.replace('<i>🔄 Última consulta:',comparison_text(previous,current)+'\n<i>🔄 Última consulta:',1)
+                    text+='\n'+comparison_text(previous,current)
                     result=self.edit_card(msg,text,markup)
                     if result:
                         self.scanner.store.card_snapshot(chat,msg['message_id'],current)
