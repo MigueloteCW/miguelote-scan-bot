@@ -1123,7 +1123,16 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
            f'├ B/S: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24h)',
            f'└ HLD: <b>{compact(info.get("holder_count"))}</b>', '',
            '🏔 <b>ATH</b>']
-    lines=lines[:-2]+activity_lines(pair,fetched)+['','🏔 <b>ATH</b>']
+    lines=lines[:-2]
+    lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), tax_line(chain,pair.get('security_sources') or {}), '🟦 <b>Distribución</b>',
+              f'👥 Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
+              '🎯 '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
+              '📦 '+pair.get('bundler_text','Bundled —').replace('🎯 ',''),
+              f'🧑‍💻 Equipo: {ratio(stat.get("dev_team_hold_rate"))}',
+              '', f'P: <code>{short(pair.get("pairAddress"))}</code>',
+              f'DEV: <code>{short(dev.get("creator_address"))}</code>',
+              'DEV SELL: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>']
+    lines+=activity_lines(pair,fetched)+['','🏔 <b>ATH</b>']
     if ath is not None and ath>0 and (current is None or current<=ath):
         lines += [f'├ Precio: <b>{fmt(ath,money=True)}</b>',f'├ {ath_mc(info)}']
         drop=(current/ath-1)*100 if current is not None else None
@@ -1139,20 +1148,11 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     if isinstance(username,str) and re.fullmatch(r'@?[A-Za-z0-9_]{1,15}',username):
         links.append(safe_link('X','https://x.com/'+username.lstrip('@')))
     if links: lines += ['', '🌐 <b>Socials</b>', ' · '.join(links)]
-    lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), tax_line(chain,pair.get('security_sources') or {}), '🟦 <b>Distribución</b>',
-              f'👥 Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
-              '🎯 '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
-              '📦 '+pair.get('bundler_text','Bundled —').replace('🎯 ',''),
-              f'🧑‍💻 Equipo: {ratio(stat.get("dev_team_hold_rate"))}',
-              '', f'P: <code>{short(pair.get("pairAddress"))}</code>',
-              f'DEV: <code>{short(dev.get("creator_address"))}</code>',
-              'DEV SELL: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>',
-              '',f'<code>{mint}</code>',
-              '<i>🔄 Última consulta: '+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</i>']
+    lines += [f'<code>{mint}</code>','<i>🔄 Última consulta: '+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</i>']
     text='\n'.join(line for line in lines if line)
     summary=aser_summary(pair.get('aser_signals'))
     if summary:
-        position=next(i for i,line in enumerate(lines) if line.startswith('P: <code>'))
+        position=len(lines)-2
         extended='\n'.join(line for line in lines[:position]+[summary]+lines[position:] if line)
         visible=html.unescape(re.sub(r'<[^>]+>','',extended))
         if len(visible.encode('utf-16-le'))//2<=1024:text=extended
@@ -1451,7 +1451,7 @@ class Bot:
                 markup=self.network_keyboard(chat,arg,pair,user)
                 if refreshing:
                     previous=self.scanner.store.card_snapshot(chat,msg['message_id'])
-                    text+='\n'+comparison_text(previous,current)
+                    text=text.replace('<i>🔄 Última consulta:',comparison_text(previous,current)+'\n<i>🔄 Última consulta:',1)
                     result=self.edit_card(msg,text,markup)
                     if result:
                         self.scanner.store.card_snapshot(chat,msg['message_id'],current)
