@@ -1,5 +1,7 @@
 """Miguelote Scan: read-only multichain scanner. Python 3.11+, stdlib only."""
 import argparse
+import struct
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import html
 import json
@@ -387,6 +389,20 @@ class Scanner:
         except DataError:
             pass
         return list(dict.fromkeys(u for u in urls if image_url(u)))[:6]
+
+    def rank_images(self,urls):
+        urls=list(dict.fromkeys(u for u in urls if image_url(u)))[:10]
+        def measure(url):
+            key=('image_size',url);hit=self.cache.get(key)
+            if hit and time.time()-hit[0]<(3600 if hit[1] else 120):return hit[1]
+            size=probe_image_size(url)
+            self.cache[key]=(time.time(),size)
+            return size
+        if not urls:return [],False
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            sizes=list(pool.map(measure,urls))
+        ranked=sorted(zip(urls,sizes),key=lambda item:image_quality(item[1]),reverse=True)
+        return [u for u,_ in ranked],any(image_quality(size)[0]>=2 for size in sizes)
 
     def extra_images(self,mint):
         # Fallback metadata is cached independently from live market refreshes.
@@ -940,6 +956,55 @@ def ath_line(info, current):
     return f'🏔 <b>ATH {fmt(ath, money=True)}</b> · {ath_mc(info)}'
 
 
+def image_dimensions(data):
+    """Read dimensions without decoding or enlarging the original image."""
+    try:
+        if data.startswith(b'\x89PNG\r\n\x1a\n') and len(data)>=24:
+            return struct.unpack('>II',data[16:24])
+        if data[:3]==b'GIF' and len(data)>=10:return struct.unpack('<HH',data[6:10])
+        if data[:4]==b'RIFF' and data[8:12]==b'WEBP':
+            kind=data[12:16]
+            if kind==b'VP8X' and len(data)>=30:
+                return 1+int.from_bytes(data[24:27],'little'),1+int.from_bytes(data[27:30],'little')
+            if kind==b'VP8 ' and data[23:26]==b'\x9d\x01\x2a':
+                w,h=struct.unpack('<HH',data[26:30]);return w&16383,h&16383
+            if kind==b'VP8L' and len(data)>=25 and data[20]==47:
+                bits=int.from_bytes(data[21:25],'little');return (bits&16383)+1,((bits>>14)&16383)+1
+        if data[:2]==b'\xff\xd8':
+            i=2
+            while i+4<=len(data):
+                if data[i]!=255:break
+                while i<len(data) and data[i]==255:i+=1
+                marker=data[i];i+=1
+                if marker in (216,217,1) or 208<=marker<=215:continue
+                length=int.from_bytes(data[i:i+2],'big')
+                if length<2 or i+length>len(data):break
+                if marker in (192,193,194,195,197,198,199,201,202,203,205,206,207):
+                    h,w=struct.unpack('>HH',data[i+3:i+7]);return w,h
+                i+=length
+    except (IndexError,ValueError,struct.error):pass
+    return None
+
+
+def probe_image_size(url):
+    try:
+        request=urllib.request.Request(url,headers={'User-Agent':'MigueloteScan/1.0','Range':'bytes=0-65535'})
+        with urllib.request.urlopen(request,timeout=2) as response:
+            return image_dimensions(response.read(65536))
+    except (OSError,ValueError):return None
+
+
+def image_quality(size):
+    if not size or min(size)<=0:return (0,0)
+    w,h=size;ratio=w/h
+    # Wide high-resolution header first, then a sharp square logo.
+    if 1.5<=ratio<=4 and w>=1280 and h>=480:level=3
+    elif .75<=ratio<=1.33 and min(w,h)>=512:level=2
+    elif min(w,h)>=256:level=1
+    else:level=0
+    return level,w*h
+
+
 def image_url(value):
     if not isinstance(value,str) or len(value)>2048:return False
     try:
@@ -1150,6 +1215,11 @@ class Bot:
 
     def send_card(self, chat, text, markup, logo, fallback=None):
         logos = logo if isinstance(logo, list) else [logo]
+        if self.scanner and hasattr(self.scanner,'rank_images'):
+            logos,sharp=self.scanner.rank_images(logos)
+            if not sharp and fallback:
+                logos,_=self.scanner.rank_images(logos+fallback())
+                fallback=None
         sent_photo=False
         for logo in logos:
             if not isinstance(logo,str) or not logo.startswith('https://') or len(logo)>=2048:
