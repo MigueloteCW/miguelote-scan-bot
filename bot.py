@@ -821,7 +821,7 @@ def security_text(mint,chain,sources,market=None):
     tax=tax_details(chain,sources)
     lines=['🔍 <b>MIGUELOTE SCAN · SEGURIDAD</b>',
            f'Red: <b>{esc(chain.upper())}</b>',f'<code>{esc(mint,96)}</code>','',
-           '🛡 <b>Índice heurístico de seguridad</b>']
+           '🛡️ <b>Audit automático · índice heurístico</b>']
     if result['score'] is None:
         lines.append('Puntuación: — · '+result['verdict'])
     else:
@@ -1081,6 +1081,21 @@ def comparison_text(old,new):
             f'Holders: {holders}\nTop 10: {top}')
 
 
+def audit_summary(chain,sources,market=None):
+    result=security_assessment(chain,sources,market)
+    status={
+        'RIESGO CRÍTICO':'🔴 Crítico',
+        'RIESGO ALTO':'🔴 Alto',
+        'PRECAUCIÓN':'🟠 Precaución',
+        'ANÁLISIS PARCIAL':'🟡 Parcial',
+        'SIN DATOS SUFICIENTES':'⚪ Sin datos',
+        'SIN ALERTAS CRÍTICAS DETECTADAS':'🟢 Sin alertas críticas',
+    }[result['verdict']]
+    if result['coverage']=='parcial' and result['verdict'] in ('RIESGO CRÍTICO','RIESGO ALTO','PRECAUCIÓN'):
+        status+=' · parcial'
+    return '🛡️ <b>Audit automático</b>: '+status
+
+
 def card(mint, pair, fetched, info=None, gmgn_note=''):
     base=pair.get('baseToken') or {}
     info=info or pair.get('gmgn_info') or {}
@@ -1098,7 +1113,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     symbol=esc(base.get('symbol','?'),18)
     lines=[f'<b>{name} (${symbol})</b>',
            f'{esc(chain.title())} · {esc(pair.get("dexId","DEX"),25)} · 🌱 {age}', '',
-           '📊 <b>Token Stats</b>',
+           '🟩 <b>Token Stats</b>',
            f'├ MC: <b>{compact(pair.get("marketCap"),True)}</b>',
            f'├ USD: <b>{fmt(current,money=True) if current is not None else "—"}</b>',
            f'├ LIQ: <b>{compact((pair.get("liquidity") or {}).get("usd"),True)}</b>',
@@ -1123,12 +1138,12 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     username=social.get('twitter_username')
     if isinstance(username,str) and re.fullmatch(r'@?[A-Za-z0-9_]{1,15}',username):
         links.append(safe_link('X','https://x.com/'+username.lstrip('@')))
-    if links: lines += ['', '🔗 <b>Socials</b>', ' · '.join(links)]
-    lines += ['', tax_line(chain,pair.get('security_sources') or {}), '👥 <b>Distribución</b>',
-              f'├ Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
-              '├ '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
-              '├ '+pair.get('bundler_text','Bundled —').replace('🎯 ',''),
-              f'└ Equipo: {ratio(stat.get("dev_team_hold_rate"))}',
+    if links: lines += ['', '🌐 <b>Socials</b>', ' · '.join(links)]
+    lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), tax_line(chain,pair.get('security_sources') or {}), '🟦 <b>Distribución</b>',
+              f'👥 Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
+              '🎯 '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
+              '📦 '+pair.get('bundler_text','Bundled —').replace('🎯 ',''),
+              f'🧑‍💻 Equipo: {ratio(stat.get("dev_team_hold_rate"))}',
               '', f'P: <code>{short(pair.get("pairAddress"))}</code>',
               f'DEV: <code>{short(dev.get("creator_address"))}</code>',
               'DEV SELL: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>',
