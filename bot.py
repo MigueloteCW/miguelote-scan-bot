@@ -436,18 +436,67 @@ class Scanner:
             if len(key)>=3 and key[0] in ('gmgn','aser') and key[-1]==normalized(mint):
                 self.cache.pop(key,None)
         self.cache.pop(('dex',normalized(mint)),None)
+        self.cache.pop(('gecko_market',self.chain,normalized(mint)),None)
         return self.market(mint)
+
+    def gecko_market(self,mint):
+        networks={'solana':'solana','ethereum':'eth','bsc':'bsc','base':'base',
+                  'arbitrum':'arbitrum','polygon':'polygon_pos','avalanche':'avax',
+                  'optimism':'optimism','fantom':'ftm','ton':'ton','sui':'sui',
+                  'tron':'tron','hyperevm':'hyperevm'}
+        network=networks.get(self.chain)
+        if not network:raise DataError('Red sin cobertura de reserva.')
+        key=('gecko_market',self.chain,normalized(mint))
+        hit=self.cache.get(key)
+        if hit and time.time()-hit[0]<30:return hit[1],hit[2],hit[0]
+        if time.time()<self.cache.get(('gecko_market_pause',),0):
+            raise DataError('Mercado de reserva temporalmente limitado.')
+        try:
+            data=self.transport('https://api.geckoterminal.com/api/v2/networks/'+network+'/tokens/'+urllib.parse.quote(mint,safe='')+'/pools?include=base_token,quote_token',timeout=8)
+        except RateLimitError as error:
+            self.cache[('gecko_market_pause',)]=time.time()+error.retry_after
+            raise
+        if not isinstance(data,dict):raise DataError('Respuesta de mercado no válida.')
+        tokens={t.get('id'):t.get('attributes',{}) for t in (data.get('included') or []) if isinstance(t,dict) and t.get('type')=='token'}
+        rows=[]
+        for pool in data.get('data') or []:
+            if not isinstance(pool,dict):continue
+            attr=pool.get('attributes') or {};rel=pool.get('relationships') or {}
+            token_id=((rel.get('base_token') or {}).get('data') or {}).get('id','')
+            token=tokens.get(token_id) or {}
+            # Pool metrics are for the base token. Never relabel quote-token metrics.
+            if not token_id.startswith(network+'_') or not same_token(token_id[len(network)+1:],mint) or not same_token(token.get('address'),mint):continue
+            if not str(pool.get('id','')).startswith(network+'_'):continue
+            price=number(attr.get('base_token_price_usd'))
+            if price is None or price<=0:continue
+            rows.append({'chainId':self.chain,'pairAddress':attr.get('address'),
+                'dexId':((rel.get('dex') or {}).get('data') or {}).get('id'),
+                'baseToken':{'address':mint,'name':token.get('name'),'symbol':token.get('symbol')},
+                'priceUsd':price,'marketCap':number(attr.get('market_cap_usd')),
+                'fdv':number(attr.get('fdv_usd')),'liquidity':{'usd':number(attr.get('reserve_in_usd'))},
+                'volume':attr.get('volume_usd') or {},'priceChange':attr.get('price_change_percentage') or {},
+                'txns':attr.get('transactions') or {},'gmgn_info':{'logo':token.get('image_url')},
+                'source':'GeckoTerminal'})
+        if not rows:raise DataError('Sin mercado verificado para este contrato y red.')
+        pair=max(rows,key=lambda p:number(p['liquidity']['usd']) or 0)
+        stamp=time.time();self.cache[key]=(stamp,pair,rows)
+        return pair,rows,stamp
 
     def market(self, mint):
         try:
             return self.gmgn_market(mint)
-        except DataError:
+        except DataError:pass
+        try:
             rows=[p for p in self.dex_pairs(mint) if p['chainId']==self.chain]
-            if not rows:
-                raise DataError('Sin datos para este contrato y red.')
-            pair=dict(max(rows,key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0))
-            pair.update(gmgn_info={},source='DexScreener')
-            return pair,rows,self.cache[('dex',normalized(mint))][0]
+            if rows:
+                pair=dict(max(rows,key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0))
+                pair.update(gmgn_info={},source='DexScreener')
+                return pair,rows,self.cache[('dex',normalized(mint))][0]
+        except DataError:pass
+        try:
+            return self.gecko_market(mint)
+        except DataError:
+            raise DataError('No se pudo obtener el mercado de este contrato en '+self.chain+'. Los proveedores no responden o no tienen cobertura. Reinténtalo más tarde.') from None
 
     def enrich_activity(self,mint,pair):
         # Enrich only the selected pool on the selected chain; never a different market.
@@ -1296,7 +1345,7 @@ class Bot:
         self.last_request[user] = time.monotonic()
         try:
             if action == 'scan':
-                pair, _, fetched = self.scanner.refresh_market(arg)
+                pair, _, fetched = (self.scanner.refresh_market(arg) if refreshing else self.scanner.market(arg))
                 pair = self.scanner.enrich_activity(arg,pair)
                 info = pair['gmgn_info']
                 pair['security_sources']=self.scanner.security_evidence(chain,arg,force=refreshing)
