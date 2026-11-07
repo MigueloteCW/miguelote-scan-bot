@@ -294,7 +294,13 @@ class Scanner:
         key=('dex', normalized(mint))
         if key in self.cache and time.time()-self.cache[key][0]<60:
             return self.cache[key][1]
-        data=self.transport('https://api.dexscreener.com/latest/dex/search?q='+urllib.parse.quote(mint,safe=''))
+        if time.time()<self.cache.get(('dex_pause',),0):
+            raise DataError('DexScreener en pausa temporal por límite de consultas.')
+        try:
+            data=self.transport('https://api.dexscreener.com/latest/dex/search?q='+urllib.parse.quote(mint,safe=''))
+        except RateLimitError as error:
+            self.cache[('dex_pause',)]=time.time()+error.retry_after
+            raise
         rows=data.get('pairs') if isinstance(data,dict) else None
         if not isinstance(rows,list):
             raise DataError('Mercado no disponible. Inténtalo más tarde.')
@@ -375,10 +381,55 @@ class Scanner:
         try:
             rows=[p for p in self.dex_pairs(mint) if p['chainId']==self.chain]
             rows.sort(key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0,reverse=True)
-            urls += [(p.get('info') or {}).get('imageUrl') for p in rows]
+            for row in rows:
+                meta=row.get('info') or {}
+                urls.extend([meta.get('header'),meta.get('imageUrl')])
         except DataError:
             pass
-        return list(dict.fromkeys(u for u in urls if isinstance(u,str) and u.startswith('https://') and len(u)<2048))[:3]
+        return list(dict.fromkeys(u for u in urls if image_url(u)))[:6]
+
+    def extra_images(self,mint):
+        # Fallback metadata is cached independently from live market refreshes.
+        key=('image_metadata',self.chain,normalized(mint))
+        hit=self.cache.get(key)
+        if hit and time.time()-hit[0]<(3600 if hit[1] else 120):return hit[1]
+        urls=[]
+        networks={'solana':'solana','ethereum':'eth','bsc':'bsc','base':'base',
+                  'arbitrum':'arbitrum','polygon':'polygon_pos','avalanche':'avax',
+                  'optimism':'optimism','fantom':'ftm','ton':'ton','sui':'sui',
+                  'tron':'tron','hyperevm':'hyperevm'}
+        network=networks.get(self.chain)
+        if network and time.time()>=self.cache.get(('image_gt_pause',),0):
+            try:
+                data=self.transport('https://api.geckoterminal.com/api/v2/networks/'+network+'/tokens/'+urllib.parse.quote(mint,safe='')+'/info',timeout=5)
+                token=data.get('data') if isinstance(data,dict) else None
+                attr=token.get('attributes') if isinstance(token,dict) else None
+                if isinstance(attr,dict) and same_token(attr.get('address'),mint) and isinstance(token.get('id'),str) and token['id'].startswith(network+'_') and same_token(token['id'][len(network)+1:],mint):
+                    sizes=attr.get('image') if isinstance(attr.get('image'),dict) else {}
+                    urls.extend([attr.get('banner_image_url'),sizes.get('large'),attr.get('image_url')])
+            except RateLimitError as error:
+                self.cache[('image_gt_pause',)]=time.time()+error.retry_after
+            except DataError:pass
+        # Recent profiles are only a fallback, never a complete token directory.
+        if not any(image_url(u) for u in urls) and time.time()>=self.cache.get(('dex_pause',),0):
+            profiles=self.cache.get(('image_dex_profiles',))
+            if not profiles or time.time()-profiles[0]>=300:
+                try:
+                    data=self.transport('https://api.dexscreener.com/token-profiles/latest/v1',timeout=5)
+                    profiles=(time.time(),data if isinstance(data,list) else [])
+                    self.cache[('image_dex_profiles',)]=profiles
+                except RateLimitError as error:
+                    self.cache[('dex_pause',)]=time.time()+error.retry_after
+                    profiles=None
+                except DataError:
+                    profiles=(time.time(),[])
+                    self.cache[('image_dex_profiles',)]=profiles
+            for row in (profiles[1] if profiles else []):
+                if isinstance(row,dict) and row.get('chainId')==self.chain and same_token(row.get('tokenAddress'),mint):
+                    urls.extend([row.get('header'),row.get('icon')])
+        result=list(dict.fromkeys(u for u in urls if image_url(u)))[:4]
+        self.cache[key]=(time.time(),result)
+        return result
 
     def refresh_market(self,mint):
         for key in list(self.cache):
@@ -840,6 +891,14 @@ def ath_line(info, current):
     return f'🏔 <b>ATH {fmt(ath, money=True)}</b> · {ath_mc(info)}'
 
 
+def image_url(value):
+    if not isinstance(value,str) or len(value)>2048:return False
+    try:
+        parsed=urllib.parse.urlsplit(value)
+        return parsed.scheme=='https' and bool(parsed.hostname) and not parsed.username
+    except ValueError:return False
+
+
 def safe_link(label, url):
     if not isinstance(url,str) or len(url)>2048:
         return None
@@ -972,7 +1031,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
 
 
 def sources_text(pair, fetched, gmgn_note=''):
-    lines = ['<b>Fuentes y alcance</b>', f'Mercado de esta ficha: {esc(pair.get("source","GMGN"))}. Red: {esc(pair.get("chainId","solana"))}. Imágenes: logo GMGN y alternativa DexScreener.',
+    lines = ['<b>Fuentes y alcance</b>', f'Mercado de esta ficha: {esc(pair.get("source","GMGN"))}. Red: {esc(pair.get("chainId","solana"))}. Imágenes: ASER, GMGN, DexScreener (cabeceras, imagen del par y perfiles) y GeckoTerminal/CoinGecko. Coincidencia por contrato y red; cobertura variable. Fuentes de reserva solo si falla el envío de las imágenes prioritarias.',
              'Con GMGN: MC = precio × suministro circulante; FDV = precio × suministro total. Con DexScreener: valores reportados, sin sustituir MC por FDV.',
              'Precio y actividad: GMGN. Variaciones calculadas con sus precios al inicio de cada período. Liquidez del pool principal indicado por GMGN.',
              'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
@@ -1040,8 +1099,9 @@ class Bot:
             payload['reply_markup'] = markup
         return self.api('sendMessage', payload)
 
-    def send_card(self, chat, text, markup, logo):
+    def send_card(self, chat, text, markup, logo, fallback=None):
         logos = logo if isinstance(logo, list) else [logo]
+        sent_photo=False
         for logo in logos:
             if not isinstance(logo,str) or not logo.startswith('https://') or len(logo)>=2048:
                 continue
@@ -1054,9 +1114,12 @@ class Bot:
                 result = self.api('sendPhoto', payload)
                 if fits:
                     return result
+                sent_photo=True
                 break
             except DataError:
                 continue
+        if not sent_photo and fallback:
+            return self.send_card(chat,text,markup,fallback())
         return self.send(chat, text, markup)
 
     def edit_card(self,msg,text,markup):
@@ -1206,7 +1269,11 @@ class Bot:
                 if valid_address(arg):
                     chain='solana'
                 else:
-                    chains=sorted({p['chainId'] for p in self.scanner.dex_pairs(arg)})
+                    try:
+                        chains=sorted({p['chainId'] for p in self.scanner.dex_pairs(arg)})
+                    except DataError:
+                        # Network discovery is optional: explicit choice can still reach GMGN.
+                        chains=[]
                     if len(chains)==1:
                         chain=chains[0]
                     else:
@@ -1255,7 +1322,8 @@ class Bot:
                     if result:
                         self.scanner.store.card_snapshot(chat,msg['message_id'],current)
                     return result
-                result=self.send_card(chat,text,markup,self.scanner.images(arg,info))
+                result=self.send_card(chat,text,markup,self.scanner.images(arg,info),
+                                      fallback=lambda:self.scanner.extra_images(arg))
                 if isinstance(result,dict) and result.get('message_id'):
                     self.scanner.store.card_snapshot(chat,result['message_id'],current)
                 return result
