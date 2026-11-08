@@ -1116,15 +1116,15 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     lines=[f'<b>{name} (${symbol})</b>',
            f'{esc(chain.title())} · {esc(pair.get("dexId","DEX"),25)} · 🌱 {age}', '',
            '🟩 <b>Token Stats</b>',
-           f'├ MC: <b>{compact(pair.get("marketCap"),True)}</b>',
+           f'├ CAPITALIZACIÓN: <b>{compact(pair.get("marketCap"),True)}</b>',
            f'├ Supply total: <b>{supply_text}</b>',
-           f'├ USD: <b>{fmt(current,money=True) if current is not None else "—"}</b>',
-           f'├ LIQ: <b>{compact((pair.get("liquidity") or {}).get("usd"),True)}</b>',
-           f'├ VOL: <b>{compact((pair.get("volume") or {}).get("h24"),True)}</b> (24h)',
-           f'├ 5m: {change(changes.get("m5"))} · 1h: {change(changes.get("h1"))}',
-           f'├ 24h: {change(changes.get("h24"))}',
-           f'├ B/S: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24h)',
-           f'└ HLD: <b>{compact(info.get("holder_count"))}</b>', '',
+           f'├ PRECIO: <b>{fmt(current,money=True) if current is not None else "—"}</b>',
+           f'├ LIQUIDEZ: <b>{compact((pair.get("liquidity") or {}).get("usd"),True)}</b>',
+           f'├ VOLUMEN: <b>{compact((pair.get("volume") or {}).get("h24"),True)}</b> (24 horas)',
+           f'├ 5 min: {change(changes.get("m5"))} · 1 hora: {change(changes.get("h1"))}',
+           f'├ 24 horas: {change(changes.get("h24"))}',
+           f'├ COMPRAS / VENTAS: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24 horas)',
+           f'└ HOLDERS: <b>{compact(info.get("holder_count"))}</b>', '',
            '🏔 <b>ATH</b>']
     if ath is not None and ath>0 and (current is None or current<=ath):
         lines += [f'├ Precio: <b>{fmt(ath,money=True)}</b>',f'├ {ath_mc(info)}']
