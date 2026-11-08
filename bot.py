@@ -864,8 +864,8 @@ def aser_summary(data):
         first=aser_first_signal(data)
         mc=number(first.get('mcap_usd')) if first else None
         value=compact(mc,True) if mc is not None and mc>=0 else '—'
-        parts.append(str(ns)+' señal'+('es' if ns!=1 else '')+' · 1ª call MC '+value)
-    if nt:parts.append(str(nt)+' mención'+('es' if nt!=1 else '')+' comunidad')
+        parts.append('<b>'+str(ns)+'</b> señal'+('es' if ns!=1 else '')+' · 1ª call MC <b>'+value+'</b>')
+    if nt:parts.append('<b>'+str(nt)+'</b> mención'+('es' if nt!=1 else '')+' comunidad')
     return '📡 <b>ASER</b>: '+' · '.join(parts)
 
 
@@ -944,8 +944,8 @@ def change(value):
 def ath_mc(info):
     ath, supply = number(info.get('ath_price')), number(info.get('circulating_supply'))
     if ath is None or ath <= 0 or supply is None or supply < 0:
-        return 'MC estimado —'
-    return f'MC estimado ≈ {compact(ath * supply, True)}'
+        return 'MC estimado <b>—</b>'
+    return f'MC estimado ≈ <b>{compact(ath * supply, True)}</b>'
 
 
 def ath_line(info, current):
@@ -1077,9 +1077,9 @@ def comparison_text(old,new):
     holders=f'{b-a:+.0f}' if comparable and a is not None and b is not None and min(a,b)>=0 else '—'
     a,b=number(old.get('top10')),number(new.get('top10'))
     top=f'{a*100:.2f}% → {b*100:.2f}%' if comparable and a is not None and b is not None and 0<=a<=1 and 0<=b<=1 else '—'
-    return (f'🔄 <b>Desde la consulta anterior · {age}</b>\n'
-            f'Precio: {percent("price")}\nLiquidez: {percent("liquidity")}\n'
-            f'Holders: {holders}\nTop 10: {top}')
+    return (f'🔄 <b>DESDE LA CONSULTA ANTERIOR · {age}</b>\n'
+            f'Precio: <b>{percent("price")}</b>\nLiquidez: <b>{percent("liquidity")}</b>\n'
+            f'Holders: <b>{holders}</b>\nTop 10: <b>{top}</b>')
 
 
 def audit_summary(chain,sources,market=None):
@@ -1088,12 +1088,16 @@ def audit_summary(chain,sources,market=None):
     label=' + '.join(providers) if providers else 'SCAN'
     score=result['score'] if providers else None
     if score is None:
-        value='⚪ —'
+        value='⚪ <b>—</b>'
     else:
         color='🟢' if score>=70 else '🟠' if score>=40 else '🔴'
         value=f'{color} <b>{score}/100</b>'
         if result['verdict']=='RIESGO CRÍTICO':value+=' · ⚠️ Crítico'
     return '🛡️ <b>AUDIT '+label.upper()+'</b>: '+value+' · Índice SCAN'
+
+
+def bold_metric(text):
+    return re.sub(r'(?<![\w>])(?:[0-9]+(?:\.[0-9]+)?%|—)',r'<b>\g<0></b>',text)
 
 
 def card(mint, pair, fetched, info=None, gmgn_note=''):
@@ -1121,25 +1125,25 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
            f'├ Precio: <b>{fmt(current,money=True) if current is not None else "—"}</b>',
            f'├ Liquidez: <b>{compact((pair.get("liquidity") or {}).get("usd"),True)}</b>',
            f'├ Volumen: <b>{compact((pair.get("volume") or {}).get("h24"),True)}</b> (24 horas)',
-           f'├ 5 min: {change(changes.get("m5"))} · 1 hora: {change(changes.get("h1"))}',
-           f'├ 24 horas: {change(changes.get("h24"))}',
+           f'├ 5 min: <b>{change(changes.get("m5"))}</b> · 1 hora: <b>{change(changes.get("h1"))}</b>',
+           f'├ 24 horas: <b>{change(changes.get("h24"))}</b>',
            f'├ Compras / Ventas: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24 horas)',
            f'└ Holders: <b>{compact(info.get("holder_count"))}</b>', '',
            '🏔 <b>ATH</b>']
     if ath is not None and ath>0 and (current is None or current<=ath):
         lines += [f'├ Precio: <b>{fmt(ath,money=True)}</b>',f'├ {ath_mc(info)}']
         drop=(current/ath-1)*100 if current is not None else None
-        lines += [f'└ Desde ATH: {change(drop)}']
+        lines += [f'└ Desde ATH: <b>{change(drop)}</b>']
     else:
-        lines += ['└ —']
+        lines += ['└ <b>—</b>']
     lines+=activity_lines(pair,fetched)
     lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), '🟦 <b>DISTRIBUCIÓN</b>',
               f'👥 Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
-              '🎯 '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
-              '📦 '+pair.get('bundler_text','Bundled —').replace('🎯 ',''),
-              f'🧑‍💻 Equipo: {ratio(stat.get("dev_team_hold_rate"))}',
-              '', f'Par: <code>{short(pair.get("pairAddress"))}</code>',
-              f'DEV: <code>{short(dev.get("creator_address"))}</code>',
+              '🎯 '+bold_metric(pair.get('sniper_text','🎯 Snipers —').replace('🎯 ','')),
+              '📦 '+bold_metric(pair.get('bundler_text','Bundled —').replace('🎯 ','')),
+              f'🧑‍💻 Equipo: <b>{ratio(stat.get("dev_team_hold_rate"))}</b>',
+              '', f'Par: <b>{short(pair.get("pairAddress"))}</b>',
+              f'DEV: <b>{short(dev.get("creator_address"))}</b>',
               'Ventas del DEV: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>']
     aser_position=len(lines)
     social=info.get('link') or {}
@@ -1151,7 +1155,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     if isinstance(username,str) and re.fullmatch(r'@?[A-Za-z0-9_]{1,15}',username):
         links.append(safe_link('X','https://x.com/'+username.lstrip('@')))
     if links: lines += ['', '🌐 <b>SOCIALS</b>', ' · '.join(links)]
-    lines += [f'<code>{mint}</code>','<i>🔄 <b>ÚLTIMA CONSULTA</b>: '+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</i>']
+    lines += [f'<code>{mint}</code>','<i>🔄 <b>ÚLTIMA CONSULTA</b>: <b>'+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</b></i>']
     text='\n'.join(line for line in lines if line)
     summary=aser_summary(pair.get('aser_signals'))
     if summary:
