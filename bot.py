@@ -1108,6 +1108,8 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     chain=pair.get('chainId','solana')
     ratio=lambda v:fmt(v,ratio=True) if number(v) is not None and 0<=number(v)<=1 else '—'
     short=lambda v: (v[:6]+'…'+v[-4:]) if valid_contract(v) else '—'
+    supply=number(info.get('total_supply'))
+    supply_text=compact(supply) if supply is not None and supply>=0 else '—'
     age=age_text(info.get('creation_timestamp'),fetched)
     name=esc(base.get('name','Token'),45)
     symbol=esc(base.get('symbol','?'),18)
@@ -1115,6 +1117,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
            f'{esc(chain.title())} · {esc(pair.get("dexId","DEX"),25)} · 🌱 {age}', '',
            '🟩 <b>Token Stats</b>',
            f'├ MC: <b>{compact(pair.get("marketCap"),True)}</b>',
+           f'├ Supply total: <b>{supply_text}</b>',
            f'├ USD: <b>{fmt(current,money=True) if current is not None else "—"}</b>',
            f'├ LIQ: <b>{compact((pair.get("liquidity") or {}).get("usd"),True)}</b>',
            f'├ VOL: <b>{compact((pair.get("volume") or {}).get("h24"),True)}</b> (24h)',
@@ -1130,7 +1133,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     else:
         lines += ['└ —']
     lines+=activity_lines(pair,fetched)
-    lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), tax_line(chain,pair.get('security_sources') or {}), '🟦 <b>Distribución</b>',
+    lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), '🟦 <b>Distribución</b>',
               f'👥 Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
               '🎯 '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
               '📦 '+pair.get('bundler_text','Bundled —').replace('🎯 ',''),
