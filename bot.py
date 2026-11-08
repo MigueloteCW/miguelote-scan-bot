@@ -1050,7 +1050,7 @@ def activity_lines(pair,now):
     boosts=extra.get('boosts') if isinstance(extra.get('boosts'),dict) else {}
     created=number(extra.get('pairCreatedAt'))
     age=age_text(created/1000 if created else None,now)
-    return ['', '⚡ <b>Actividad del par</b>',
+    return ['', '⚡ <b>ACTIVIDAD DEL PAR</b>',
             f'├ LIQ/MC: <b>{liquidity_ratio}</b>',
             f'├ VOL/LIQ 24h: <b>{turnover}</b>',
             f'└ Boosts DEX: <b>{count(boosts.get("active"))}</b>']
@@ -1066,7 +1066,7 @@ def comparison_snapshot(mint,pair,fetched,info):
 
 def comparison_text(old,new):
     if not old or any(old.get(k)!=new.get(k) for k in ('mint','chain')):
-        return '🔄 <b>Desde la consulta anterior</b>\nComparación disponible en la próxima actualización.'
+        return '🔄 <b>DESDE LA CONSULTA ANTERIOR</b>\nComparación disponible en la próxima actualización.'
     elapsed=max(0,int(new['time']-old['time']))
     age=f'{elapsed}s' if elapsed<60 else f'{elapsed//60} min' if elapsed<3600 else f'{elapsed//3600}h {(elapsed%3600)//60} min'
     comparable=old.get('source')==new.get('source') and old.get('pool')==new.get('pool')
@@ -1093,7 +1093,7 @@ def audit_summary(chain,sources,market=None):
         color='🟢' if score>=70 else '🟠' if score>=40 else '🔴'
         value=f'{color} <b>{score}/100</b>'
         if result['verdict']=='RIESGO CRÍTICO':value+=' · ⚠️ Crítico'
-    return '🛡️ <b>AUDIT '+label+'</b>: '+value+' · índice SCAN'
+    return '🛡️ <b>AUDIT '+label.upper()+'</b>: '+value+' · Índice SCAN'
 
 
 def card(mint, pair, fetched, info=None, gmgn_note=''):
@@ -1115,16 +1115,16 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     symbol=esc(base.get('symbol','?'),18)
     lines=[f'<b>{name} (${symbol})</b>',
            f'{esc(chain.title())} · {esc(pair.get("dexId","DEX"),25)} · 🌱 {age}', '',
-           '🟩 <b>Token Stats</b>',
-           f'├ CAPITALIZACIÓN: <b>{compact(pair.get("marketCap"),True)}</b>',
+           '🟩 <b>TOKEN STATS</b>',
+           f'├ Capitalización: <b>{compact(pair.get("marketCap"),True)}</b>',
            f'├ Supply total: <b>{supply_text}</b>',
-           f'├ PRECIO: <b>{fmt(current,money=True) if current is not None else "—"}</b>',
-           f'├ LIQUIDEZ: <b>{compact((pair.get("liquidity") or {}).get("usd"),True)}</b>',
-           f'├ VOLUMEN: <b>{compact((pair.get("volume") or {}).get("h24"),True)}</b> (24 horas)',
+           f'├ Precio: <b>{fmt(current,money=True) if current is not None else "—"}</b>',
+           f'├ Liquidez: <b>{compact((pair.get("liquidity") or {}).get("usd"),True)}</b>',
+           f'├ Volumen: <b>{compact((pair.get("volume") or {}).get("h24"),True)}</b> (24 horas)',
            f'├ 5 min: {change(changes.get("m5"))} · 1 hora: {change(changes.get("h1"))}',
            f'├ 24 horas: {change(changes.get("h24"))}',
-           f'├ COMPRAS / VENTAS: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24 horas)',
-           f'└ HOLDERS: <b>{compact(info.get("holder_count"))}</b>', '',
+           f'├ Compras / Ventas: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24 horas)',
+           f'└ Holders: <b>{compact(info.get("holder_count"))}</b>', '',
            '🏔 <b>ATH</b>']
     if ath is not None and ath>0 and (current is None or current<=ath):
         lines += [f'├ Precio: <b>{fmt(ath,money=True)}</b>',f'├ {ath_mc(info)}']
@@ -1133,14 +1133,14 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     else:
         lines += ['└ —']
     lines+=activity_lines(pair,fetched)
-    lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), '🟦 <b>Distribución</b>',
+    lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), '🟦 <b>DISTRIBUCIÓN</b>',
               f'👥 Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
               '🎯 '+pair.get('sniper_text','🎯 Snipers —').replace('🎯 ',''),
               '📦 '+pair.get('bundler_text','Bundled —').replace('🎯 ',''),
               f'🧑‍💻 Equipo: {ratio(stat.get("dev_team_hold_rate"))}',
-              '', f'P: <code>{short(pair.get("pairAddress"))}</code>',
+              '', f'Par: <code>{short(pair.get("pairAddress"))}</code>',
               f'DEV: <code>{short(dev.get("creator_address"))}</code>',
-              'DEV SELL: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>']
+              'Ventas del DEV: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>']
     aser_position=len(lines)
     social=info.get('link') or {}
     links=[]
@@ -1150,8 +1150,8 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     username=social.get('twitter_username')
     if isinstance(username,str) and re.fullmatch(r'@?[A-Za-z0-9_]{1,15}',username):
         links.append(safe_link('X','https://x.com/'+username.lstrip('@')))
-    if links: lines += ['', '🌐 <b>Socials</b>', ' · '.join(links)]
-    lines += [f'<code>{mint}</code>','<i>🔄 Última consulta: '+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</i>']
+    if links: lines += ['', '🌐 <b>SOCIALS</b>', ' · '.join(links)]
+    lines += [f'<code>{mint}</code>','<i>🔄 <b>ÚLTIMA CONSULTA</b>: '+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</i>']
     text='\n'.join(line for line in lines if line)
     summary=aser_summary(pair.get('aser_signals'))
     if summary:
