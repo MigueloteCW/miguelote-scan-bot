@@ -7,7 +7,7 @@ import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from bot import Bot, DataError, Scanner, Store, fetch
+from bot import Bot, DataError, DeliveryRetryError, Scanner, Store, fetch
 
 MAX_BODY = 64 * 1024
 
@@ -21,7 +21,11 @@ class WebhookApp:
         self.cache = {}
         self.last_request = {}
         self.gmgn_blocked_until = 0
-        # Bot/SQLite are constructed in the request thread that uses them.
+        self.store = None
+        self.scanner = None
+        self.bot = None
+        self.next_prune = 0
+        # Reuse clients/cache across requests; Bot and Store serialize their access.
 
     def process(self, payload, secret):
         if not hmac.compare_digest(secret, self.secret):
@@ -33,28 +37,36 @@ class WebhookApp:
         store = None
         scanner = None
         try:
-            store = Store(self.db_path)
+            if self.store is None:
+                self.store = Store(self.db_path)
+                self.scanner = Scanner(self.store, gmgn=self.gmgn)
+                self.scanner.cache = self.cache
+                self.bot = Bot(self.token, self.scanner, self.allowed)
+                self.bot.last_request = self.last_request
+            store = self.store
             store.db.execute('CREATE TABLE IF NOT EXISTS handled_updates (id INTEGER PRIMARY KEY, handled REAL)')
             if store.db.execute('SELECT 1 FROM handled_updates WHERE id=?', (payload['update_id'],)).fetchone():
                 return 200
-            scanner = Scanner(store, gmgn=self.gmgn)
-            scanner.cache = self.cache
-            scanner.gmgn_blocked_until = self.gmgn_blocked_until
-            bot = Bot(self.token, scanner, self.allowed)
-            bot.last_request = self.last_request
+            scanner = self.scanner
+            bot = self.bot
+            if time.monotonic() >= self.next_prune:
+                store.prune()
+                self.next_prune = time.monotonic() + 86400
             bot.handle(payload)
             store.db.execute('INSERT INTO handled_updates VALUES (?,?)', (payload['update_id'], time.time()))
             store.db.execute('DELETE FROM handled_updates WHERE handled < ?', (time.time() - 7 * 86400,))
             store.db.commit()
             return 200
+        except DeliveryRetryError:
+            return 503  # The exact delivery and retry deadline are persisted; Telegram retries.
         except (DataError, sqlite3.Error, ValueError, TypeError, KeyError):
             print('Consulta no completada; Telegram puede reintentar.', flush=True)
             return 503
         finally:
             if scanner:
                 self.gmgn_blocked_until = scanner.gmgn_blocked_until
-            if store:
-                store.db.close()
+                self.cache = scanner.cache
+                self.last_request = self.bot.last_request
             self.lock.release()
 
 

@@ -1,26 +1,39 @@
 """Miguelote Scan: read-only multichain scanner. Python 3.11+, stdlib only."""
 import argparse
-import struct
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import html
+import http.client
+import ipaddress
 import json
 import math
 import os
 import re
 import shutil
+import socket
 import sqlite3
+import struct
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
 
 ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 NA = 'No disponible'
+USER_AGENT = 'MigueloteScan/1.0'
+# Índice SCAN: verde >= SCORE_OK, naranja >= SCORE_WARN, rojo por debajo.
+# Veredicto, color y leyenda comparten estos cortes.
+SCORE_OK = 70
+SCORE_WARN = 40
+CAPTION_LIMIT = 1024  # pie de foto de Telegram, en unidades UTF-16
+CHAIN_ALIASES = {'sol': 'solana', 'eth': 'ethereum', 'bnb': 'bsc', 'bnbchain': 'bsc',
+                 'arb': 'arbitrum', 'avax': 'avalanche', 'matic': 'polygon',
+                 'poly': 'polygon', 'op': 'optimism'}
 
 class DataError(Exception):
     pass
@@ -30,6 +43,20 @@ class RateLimitError(DataError):
     def __init__(self, message, retry_after=300):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class TelegramRequestError(DataError):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+class DeliveryRetryError(DataError):
+    """Telegram explicitly rejected a delivery with 429; safe to retry exactly it."""
+    def __init__(self, method, payload, retry_after):
+        super().__init__('Telegram solicita esperar antes de enviar.')
+        self.retry_after = max(1, retry_after)
+        self.steps = [{'method': method, 'payload': payload}]
 
 
 def retry_delay(value):
@@ -67,6 +94,17 @@ def same_token(a,b):
     return isinstance(a,str) and normalized(a)==normalized(b)
 
 
+def canonical_chain(value):
+    value = str(value).lower()
+    return CHAIN_ALIASES.get(value, value)
+
+
+def network_contract(text):
+    """True para `red:contrato` con un contrato válido (evita reaccionar a textos como 11:30)."""
+    match = re.fullmatch(r'([A-Za-z0-9-]+):(\S+)', text)
+    return bool(match and valid_contract(match.group(2)))
+
+
 def number(value):
     if isinstance(value, bool) or value is None:
         return None
@@ -97,7 +135,7 @@ def esc(value, limit=100):
 
 
 def fetch(url, payload=None, timeout=20, extra_headers=None):
-    headers = {'User-Agent': 'VerazBot/0.1', 'Accept': 'application/json'}
+    headers = {'User-Agent': USER_AGENT, 'Accept': 'application/json'}
     headers.update(extra_headers or {})
     data = None
     if payload is not None:
@@ -120,79 +158,103 @@ def fetch(url, payload=None, timeout=20, extra_headers=None):
                 if 'message is not modified' in detail.lower():return {'ok':True,'result':True}
             except (ValueError,OSError,AttributeError):pass
         reasons = {400: 'petición no aceptada', 401: 'autenticación requerida',
-                   403: 'acceso denegado', 404: 'recurso no encontrado',
+                   403: 'acceso denegado', 404: 'recurso no encontrado', 409: 'conflicto: otra instancia o un webhook activo',
                    429: 'límite de consultas alcanzado'}
         if error.code == 429:
             delay = retry_delay((error.headers or {}).get('Retry-After'))
+            if host == 'api.telegram.org':
+                try:
+                    body = json.loads(error.read(16384))
+                    seconds = number((body.get('parameters') or {}).get('retry_after'))
+                    if seconds is not None and seconds >= 0:
+                        delay = max(1, seconds)
+                except (ValueError, OSError, AttributeError, http.client.HTTPException):
+                    pass
             raise RateLimitError(f'{provider}: HTTP 429 — límite de consultas alcanzado.', delay) from None
         reason = reasons.get(error.code, 'error del servicio')
+        if host == 'api.telegram.org':
+            raise TelegramRequestError(f'Telegram: HTTP {error.code} — {reason}.', error.code) from None
         raise DataError(f'{provider}: HTTP {error.code} — {reason}.') from None
-    except (TimeoutError, urllib.error.URLError, OSError):
+    except (TimeoutError, urllib.error.URLError, OSError, http.client.HTTPException):
+        if urllib.parse.urlsplit(url).hostname == 'api.telegram.org':
+            raise TelegramRequestError('Telegram no confirmó el resultado de la petición.') from None
         raise DataError('No se pudo conectar con el proveedor o se agotó el tiempo de espera.') from None
     except ValueError:
+        if urllib.parse.urlsplit(url).hostname == 'api.telegram.org':
+            raise TelegramRequestError('Telegram devolvió una respuesta no válida.') from None
         raise DataError('El proveedor devolvió una respuesta no válida.') from None
-
-
-def select_pair(rows, mint):
-    if not isinstance(rows, list):
-        raise DataError('Respuesta de mercado no reconocida.')
-    pairs = [p for p in rows if isinstance(p, dict) and p.get('chainId') == 'solana'
-             and (p.get('baseToken') or {}).get('address') == mint
-             and valid_address(p.get('pairAddress'))]
-    if not pairs:
-        raise DataError('Sin par indexado con este contrato como token base en Solana.')
-    def rank(p):
-        return (number((p.get('liquidity') or {}).get('usd')) or 0, p['pairAddress'])
-    return max(pairs, key=rank), pairs
 
 
 class Store:
     def __init__(self, path='veraz.sqlite3'):
-        self.db = sqlite3.connect(path)
-        self.db.execute('CREATE TABLE IF NOT EXISTS preferences (user INTEGER PRIMARY KEY, provider TEXT)')
-        self.db.execute('CREATE TABLE IF NOT EXISTS snapshots (mint TEXT, fetched REAL, pair TEXT, payload TEXT)')
-        self.db.execute('CREATE INDEX IF NOT EXISTS by_mint ON snapshots(mint,fetched)')
-        self.db.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)')
-        self.db.commit()
+        # check_same_thread=False: el acceso se serializa con self.lock (webhook con hilos).
+        self.lock = threading.RLock()
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        with self.lock:
+            self.db.execute('CREATE TABLE IF NOT EXISTS preferences (user INTEGER PRIMARY KEY, provider TEXT)')
+            self.db.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)')
+            if 'updated' not in {row[1] for row in self.db.execute('PRAGMA table_info(state)')}:
+                # Bases creadas por versiones anteriores: añade la marca de tiempo.
+                self.db.execute('ALTER TABLE state ADD COLUMN updated REAL')
+                self.db.execute('UPDATE state SET updated=?', (time.time(),))
+            self.db.commit()
+        self.prune()
+
+    def put(self, key, value):
+        with self.lock:
+            self.db.execute('INSERT OR REPLACE INTO state(key,value,updated) VALUES (?,?,?)', (key, value, time.time()))
+            self.db.commit()
+
+    def delete(self, key):
+        with self.lock:
+            self.db.execute('DELETE FROM state WHERE key=?', (key,))
+            self.db.commit()
+
+    def get(self, key):
+        with self.lock:
+            row = self.db.execute('SELECT value FROM state WHERE key=?', (key,)).fetchone()
+        return row[0] if row else None
+
+    def prune(self, days=30):
+        """Borra referencias y snapshots de botones con más de `days` días."""
+        with self.lock:
+            self.db.execute("DELETE FROM state WHERE (key LIKE 'ref:%' OR key LIKE 'card:%') AND updated < ?",
+                            (time.time() - days * 86400,))
+            self.db.commit()
 
     def reference(self, data=None, key=None):
         if data is not None:
-            value=json.dumps(data,sort_keys=True)
-            key=hashlib.sha256(value.encode()).hexdigest()[:20]
-            self.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', ('ref:'+key,value))
-            self.db.commit()
+            value = json.dumps(data, sort_keys=True)
+            key = hashlib.sha256(value.encode()).hexdigest()[:20]
+            self.put('ref:' + key, value)
             return key
-        row=self.db.execute('SELECT value FROM state WHERE key=?',('ref:'+key,)).fetchone()
-        return json.loads(row[0]) if row else None
+        value = self.get('ref:' + str(key))
+        return json.loads(value) if value else None
 
-    def card_snapshot(self,chat,message_id,value=None):
-        key=f'card:{chat}:{message_id}'
+    def card_snapshot(self, chat, message_id, value=None):
+        key = f'card:{chat}:{message_id}'
         if value is not None:
-            self.db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',(key,json.dumps(value)))
-            self.db.commit()
-            return
-        row=self.db.execute('SELECT value FROM state WHERE key=?',(key,)).fetchone()
-        return json.loads(row[0]) if row else None
+            self.put(key, json.dumps(value))
+            return None
+        value = self.get(key)
+        return json.loads(value) if value else None
 
     def preference(self, user, provider=None):
         if provider is not None:
             if provider not in ('dexscreener', 'dextools'):
                 raise ValueError('Proveedor incorrecto')
-            self.db.execute('INSERT OR REPLACE INTO preferences VALUES (?,?)', (user, provider))
-            self.db.commit()
-        row = self.db.execute('SELECT provider FROM preferences WHERE user=?', (user,)).fetchone()
+            with self.lock:
+                self.db.execute('INSERT OR REPLACE INTO preferences VALUES (?,?)', (user, provider))
+                self.db.commit()
+        with self.lock:
+            row = self.db.execute('SELECT provider FROM preferences WHERE user=?', (user,)).fetchone()
         return row[0] if row else 'dexscreener'
-
-    def save(self, mint, pair, fetched):
-        self.db.execute('INSERT INTO snapshots VALUES (?,?,?,?)', (mint, fetched, pair['pairAddress'], json.dumps(pair)))
-        self.db.commit()
 
     def offset(self, value=None):
         if value is not None:
-            self.db.execute("INSERT OR REPLACE INTO state VALUES ('offset',?)", (str(value),))
-            self.db.commit()
-        row = self.db.execute("SELECT value FROM state WHERE key='offset'").fetchone()
-        return int(row[0]) if row else 0
+            self.put('offset', str(value))
+        value = self.get('offset')
+        return int(value) if value else 0
 
 
 class Scanner:
@@ -200,7 +262,28 @@ class Scanner:
         self.store, self.transport, self.gmgn = store, transport, gmgn
         self.cache = {}
         self.gmgn_blocked_until = 0
+        self.gmgn_neg = {}        # consultas auxiliares fallidas: (clave) -> instante
+        self.gmgn_aux_fails = 0   # fallos auxiliares consecutivos
         self.chain = "solana"
+        self.dex_lock = threading.RLock()
+        self.gmgn_lock = threading.RLock()
+
+    def prune(self, max_age=3600, limit=1500):
+        """Acota la caché en memoria: descarta entradas antiguas cuando crece demasiado."""
+        now = time.time()
+        if len(self.gmgn_neg) > 500:
+            self.gmgn_neg = dict(sorted(((k, v) for k, v in self.gmgn_neg.items() if now - v < 60), key=lambda item: item[1])[-500:])
+        if len(self.cache) <= limit:
+            return
+        entries = [(value[0], key) for key, value in list(self.cache.items())
+                   if isinstance(value, tuple) and value and isinstance(value[0], (int, float))]
+        for fetched, key in entries:
+            if now - fetched > max_age:
+                self.cache.pop(key, None)
+        for _, key in sorted(entries, key=lambda item: item[0]):
+            if len(self.cache) <= limit:
+                break
+            self.cache.pop(key, None)
 
     def search_ticker(self,ticker):
         ticker=ticker.lstrip('$').upper()
@@ -227,6 +310,17 @@ class Scanner:
         return results
 
     def provider_security(self, source, chain, mint, force=False):
+        key = ('security_negative', source, chain, normalized(mint))
+        hit = self.cache.get(key)
+        if hit and time.time() - hit[0] < 30:
+            raise DataError('Consulta de seguridad temporalmente no disponible.')
+        try:
+            return self._provider_security(source, chain, mint, force)
+        except DataError:
+            self.cache[key] = (time.time(), None)
+            raise
+
+    def _provider_security(self, source, chain, mint, force=False):
         """Fixed read-only security endpoints. Missing results never mean 0% or safe."""
         key=('security',source,chain,normalized(mint))
         if not force and key in self.cache and time.time()-self.cache[key][0]<90:
@@ -245,7 +339,7 @@ class Scanner:
                 raise DataError('GoPlus sin cobertura confirmada para esta combinación red/contrato.')
             key_value=os.environ.get('GOPLUS_ACCESS_TOKEN','').strip()
             headers={'Authorization':'Bearer '+key_value} if key_value else None
-            data=(fetch(url,timeout=10,extra_headers=headers) if self.transport is fetch else self.transport(url))
+            data=(fetch(url,timeout=6,extra_headers=headers) if self.transport is fetch else self.transport(url))
             if not isinstance(data,dict) or str(data.get('code'))!='1':
                 raise DataError('GoPlus no devolvió información de seguridad válida.')
             result=data.get('result')
@@ -258,7 +352,7 @@ class Scanner:
                 raise DataError('Honeypot.is no verifica esta red.')
             cid={'ethereum':1,'bsc':56,'base':8453}[chain]
             url=f'https://api.honeypot.is/v2/IsHoneypot?address={address}&chainID={cid}'
-            data=(fetch(url,timeout=10) if self.transport is fetch else self.transport(url))
+            data=(fetch(url,timeout=6) if self.transport is fetch else self.transport(url))
             if not isinstance(data,dict) or not isinstance(data.get('token'),dict) or not same_token(data['token'].get('address'),mint):
                 raise DataError('Honeypot.is no confirmó el contrato consultado.')
             match=data
@@ -266,7 +360,7 @@ class Scanner:
             if chain!='solana' or not valid_address(mint):
                 raise DataError('RugCheck solo se consulta para tokens de Solana.')
             url=f'https://api.rugcheck.xyz/v1/tokens/{address}/report/summary'
-            match=(fetch(url,timeout=10) if self.transport is fetch else self.transport(url))
+            match=(fetch(url,timeout=6) if self.transport is fetch else self.transport(url))
             if not isinstance(match,dict) or not any(k in match for k in ('risks','score','lpLockedPct','tokenProgram')):
                 raise DataError('RugCheck no devolvió un informe verificable.')
         else:
@@ -293,13 +387,18 @@ class Scanner:
         return sources
 
     def dex_pairs(self, mint):
+        # Images and activity share the same lookup, including when running concurrently.
+        with self.dex_lock:
+            return self._dex_pairs(mint)
+
+    def _dex_pairs(self, mint):
         key=('dex', normalized(mint))
         if key in self.cache and time.time()-self.cache[key][0]<60:
             return self.cache[key][1]
         if time.time()<self.cache.get(('dex_pause',),0):
             raise DataError('DexScreener en pausa temporal por límite de consultas.')
         try:
-            data=self.transport('https://api.dexscreener.com/latest/dex/search?q='+urllib.parse.quote(mint,safe=''))
+            data=self.transport('https://api.dexscreener.com/latest/dex/search?q='+urllib.parse.quote(mint,safe=''), timeout=6)
         except RateLimitError as error:
             self.cache[('dex_pause',)]=time.time()+error.retry_after
             raise
@@ -320,7 +419,7 @@ class Scanner:
             if result is None:raise DataError('Aser no disponible.')
             return result
         try:
-            result=self.transport('https://aser.trade/api/'+key[1]+'/'+urllib.parse.quote(mint,safe=''))
+            result=self.transport('https://aser.trade/api/'+key[1]+'/'+urllib.parse.quote(mint,safe=''), timeout=5)
             item=result if live else result.get('token')
             if not isinstance(item,dict) or item.get('mint')!=mint:raise DataError('Aser no confirmó el contrato.')
             self.cache[key]=(time.time(),item)
@@ -449,8 +548,11 @@ class Scanner:
 
     def refresh_market(self,mint):
         for key in list(self.cache):
-            if len(key)>=3 and key[0] in ('gmgn','aser') and key[-1]==normalized(mint):
+            if len(key)>=3 and (key[0]=='gmgn' or key[:2] in (('aser','signals'),('aser','coin'))) and key[-1]==normalized(mint):
                 self.cache.pop(key,None)
+        for key in list(self.gmgn_neg):
+            if key[-1]==normalized(mint):
+                self.gmgn_neg.pop(key,None)
         self.cache.pop(('dex',normalized(mint)),None)
         self.cache.pop(('gecko_market',self.chain,normalized(mint)),None)
         return self.market(mint)
@@ -543,10 +645,10 @@ class Scanner:
             old = number(price.get('price_' + window))
             changes[field] = (current / old - 1) * 100 if current is not None and old is not None and old > 0 else None
         address = info.get('biggest_pool_address') or pool.get('pool_address')
-        pair = {'baseToken': {'name': info.get('name', 'Token'), 'symbol': info.get('symbol', '?')},
+        pair = {'baseToken': {'name': info.get('name') or 'Token', 'symbol': info.get('symbol') or '?'},
                 'pairAddress': address if valid_contract(address) else None,
                 'chainId': self.chain, 'source': 'GMGN',
-                'dexId': pool.get('exchange', 'GMGN'), 'priceUsd': current,
+                'dexId': pool.get('exchange') or 'GMGN', 'priceUsd': current,
                 'marketCap': product(info.get('circulating_supply')), 'fdv': product(info.get('total_supply')),
                 'liquidity': {'usd': info.get('liquidity') if info.get('liquidity') is not None else pool.get('liquidity')},
                 'volume': {'h24': price.get('volume_24h')}, 'priceChange': changes,
@@ -556,6 +658,10 @@ class Scanner:
         return pair, [pair], fetched
 
     def gmgn_query(self, command, mint, wallet=None):
+        # Keep the existing request pacing; concurrency must not burst the GMGN quota.
+        return self._gmgn_query(command, mint, wallet)
+
+    def _gmgn_query(self, command, mint, wallet=None):
         if not valid_contract(mint) or self.chain not in GMGN_CHAINS:
             raise DataError('Sin cobertura de GMGN para esta red.')
         if not self.gmgn:
@@ -564,6 +670,8 @@ class Scanner:
         key = ('gmgn', self.chain, command, normalized(wallet), normalized(mint)) if command=='dev_sales' else ('gmgn', self.chain, command, normalized(mint))
         if key in self.cache and time.time() - self.cache[key][0] < 60:
             return self.cache[key][1]
+        if time.time() - self.gmgn_neg.get(key, 0) < 60:
+            raise DataError('GMGN no devolvió datos para esta consulta hace instantes; reintento en breve.')
         if time.time() < self.gmgn_blocked_until:
             raise DataError('GMGN en pausa por límite de consultas; vuelve a intentarlo más tarde.')
         if not shutil.which('gmgn-cli'):
@@ -575,27 +683,42 @@ class Scanner:
             args += ['--tag', 'sniper' if command=='sniper_holders' else 'bundler', '--limit', '100', '--order-by', 'amount_percentage', '--direction', 'desc']
         if command == 'holders':
             args += ['--limit', '10', '--order-by', 'amount_percentage', '--direction', 'desc']
-        delay = 1.1 - (time.monotonic() - self.cache.get(('gmgn_last',), 0))
-        if delay > 0:
-            time.sleep(delay)
-        self.cache[('gmgn_last',)] = time.monotonic()
+        with self.gmgn_lock:
+            delay = 1.1 - (time.monotonic() - self.cache.get(('gmgn_last',), 0))
+            if delay > 0:
+                time.sleep(delay)
+            if time.time() < self.gmgn_blocked_until:
+                raise DataError('GMGN en pausa temporal por cuota.')
+            self.cache[('gmgn_last',)] = time.monotonic()
+        def fail(message, limited=False):
+            self.gmgn_neg[key] = time.time()
+            if limited:
+                self.gmgn_blocked_until = time.time() + 300
+                raise DataError(message + ' Pausa de 5 minutos.') from None
+            # A token/endpoint failure must not disable unrelated tokens and endpoints.
+            raise DataError(message) from None
+
         try:
-            proc = subprocess.run(args, capture_output=True, text=True, timeout=25, check=False)
-            if proc.returncode:
-                self.gmgn_blocked_until = time.time() + 300
-                raise DataError('GMGN no devolvió datos: revisa clave, permisos y cuota gratuita. Pausa de 5 minutos.')
-            data = json.loads(proc.stdout)
-            if not isinstance(data, dict):
-                raise DataError('Formato GMGN no reconocido.')
-            if data.get('code') not in (None, 0, '0', 200, '200') or data.get('success') is False:
-                self.gmgn_blocked_until = time.time() + 300
-                raise DataError('GMGN rechazó la consulta. Pausa de 5 minutos.')
-            data = data.get('data', data)
-            if not isinstance(data, dict):
-                raise DataError('Formato GMGN no reconocido.')
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired, ValueError):
-            self.gmgn_blocked_until = time.time() + 300
-            raise DataError('GMGN no disponible. Pausa de 5 minutos.') from None
+            fail('GMGN no disponible.')
+        if proc.returncode:
+            report = (proc.stderr or '') + ' ' + (proc.stdout or '')[:500]
+            fail('GMGN no devolvió datos: revisa clave, permisos y cuota gratuita.',
+                 limited=bool(re.search(r'429|rate.?limit|too many|quota', report, re.I)))
+        try:
+            data = json.loads(proc.stdout)
+        except ValueError:
+            fail('Formato GMGN no reconocido.')
+        if not isinstance(data, dict):
+            fail('Formato GMGN no reconocido.')
+        if data.get('code') not in (None, 0, '0', 200, '200') or data.get('success') is False:
+            fail('GMGN rechazó la consulta.',
+                 limited=bool(re.search(r'429|limit', str(data.get('message') or data.get('msg') or ''), re.I)))
+        data = data.get('data', data)
+        if not isinstance(data, dict):
+            fail('Formato GMGN no reconocido.')
+        self.gmgn_aux_fails = 0
         self.cache[key] = (time.time(), data)
         return data
 
@@ -644,6 +767,38 @@ class Scanner:
         label = 'Snipers' if tag=='sniper' else 'Bundled'
         if len(rows)>=100: label += ' (parcial)'
         return f'🎯 {label}: {fmt(total, ratio=True)}'
+
+    def card_inputs(self, mint, pair, refreshing=False):
+        info = pair.get('gmgn_info') or {}
+        chain = self.chain
+        jobs = {
+            'activity': (lambda: self.enrich_activity(mint, pair), dict(pair)),
+            'security_sources': (lambda: self.security_evidence(chain, mint, force=refreshing), {}),
+            'sniper_text': (lambda: self.current_snipers(mint), '🎯 Snipers —'),
+            'bundler_text': (lambda: self.current_tag_holdings(mint, 'bundler'), 'Bundled —'),
+            'dev_sell_text': (lambda: self.dev_sell(mint, info), '⚪ Sin verificar'),
+        }
+        if chain == 'solana':
+            jobs['aser_signals'] = (lambda: self.aser_signals(mint), None)
+        if not refreshing:
+            jobs['images'] = (lambda: self.rank_images(self.images(mint, info))[0], [])
+        results = {}
+        with ThreadPoolExecutor(max_workers=7) as pool:
+            pending = {name: pool.submit(fn) for name, (fn, _) in jobs.items()}
+            for name, future in pending.items():
+                try:
+                    results[name] = future.result()
+                except Exception as error:
+                    print('Consulta opcional fallida: ' + name + ' (' + type(error).__name__ + ')', flush=True)
+                    results[name] = jobs[name][1]
+        result = dict(results['activity'])
+        result.update({key: results[key] for key in ('sniper_text', 'bundler_text', 'dev_sell_text')})
+        result['security_sources'] = results['security_sources']
+        if results.get('aser_signals') is not None:
+            result['aser_signals'] = results['aser_signals']
+        else:
+            result.pop('aser_signals', None)
+        return result, results.get('images', [])
 
     def history(self, mint):
         pair, _, fetched = self.market(mint)
@@ -707,13 +862,6 @@ def tax_details(chain, sources):
     if source is None and (buy is not None or sell is not None):source='Honeypot.is'
     return {'buy':buy,'sell':sell,'transfer':None,'source':source,'mismatch':mismatch,
             'honeypot_buy':hb,'honeypot_sell':hs}
-
-
-def tax_line(chain,sources):
-    tax=tax_details(chain,sources)
-    if chain=='solana':
-        return '🧾 TAX C/V: — · Fee transferencia: '+percentage(tax['transfer'])
-    return '🧾 TAX C/V: '+percentage(tax['buy'])+' / '+percentage(tax['sell'])
 
 
 def security_assessment(chain,sources,market=None):
@@ -808,8 +956,8 @@ def security_assessment(chain,sources,market=None):
     # Never label a token low-risk on the strength of one source or few fields.
     if critical:verdict='RIESGO CRÍTICO'
     elif score is None:verdict='ANÁLISIS PARCIAL'
-    elif score<45:verdict='RIESGO ALTO'
-    elif score<75:verdict='PRECAUCIÓN'
+    elif score<SCORE_WARN:verdict='RIESGO ALTO'
+    elif score<SCORE_OK:verdict='PRECAUCIÓN'
     elif evidence<5 or len(sources)<2:verdict='ANÁLISIS PARCIAL'
     else:verdict='SIN ALERTAS CRÍTICAS DETECTADAS'
     return {'score':score,'verdict':verdict,'flags':[name for name,_ in flags],
@@ -826,7 +974,7 @@ def security_text(mint,chain,sources,market=None):
         lines.append('Puntuación: — · '+result['verdict'])
     else:
         lines.append(f'Índice SCAN: <b>{result["score"]}/100</b> · {result["verdict"]}')
-    lines += ['Índice calculado por Miguelote Scan con las comprobaciones recibidas; no es una nota del proveedor. Verde: 70–100; naranja: 40–69; rojo: 0–39. —: sin datos suficientes para puntuar.']
+    lines += [f'Índice calculado por Miguelote Scan con las comprobaciones recibidas; no es una nota del proveedor. Verde: {SCORE_OK}–100; naranja: {SCORE_WARN}–{SCORE_OK-1}; rojo: 0–{SCORE_WARN-1}. —: sin datos suficientes para puntuar.']
     lines += ['', '🧾 <b>Impuestos/comisiones del token</b>']
     if chain=='solana':
         lines.append('Compra / venta: — (no inferible con estas fuentes)')
@@ -938,7 +1086,11 @@ def change(value):
     n = number(value)
     if n is None:
         return '—'
-    return ('🟢 +' if n > 0 else '🔴 ' if n < 0 else '') + f'{n:.2f}'.rstrip('0').rstrip('.') + '%'
+    rounded = round(n, 2)
+    if rounded == 0:
+        return '0%'
+    text = f'{abs(rounded):.2f}'.rstrip('0').rstrip('.')
+    return ('🟢 +' if rounded > 0 else '🔴 -') + text + '%'
 
 
 def ath_mc(info):
@@ -946,15 +1098,6 @@ def ath_mc(info):
     if ath is None or ath <= 0 or supply is None or supply < 0:
         return 'MC estimado <b>—</b>'
     return f'MC estimado ≈ <b>{compact(ath * supply, True)}</b>'
-
-
-def ath_line(info, current):
-    ath, current = number(info.get('ath_price')), number(current)
-    if ath is None or ath <= 0:
-        return '🏔 ATH —'
-    if current is not None and ath < current:
-        return '🏔 <b>ATH de precio: dato inconsistente</b>'
-    return f'🏔 <b>ATH {fmt(ath, money=True)}</b> · {ath_mc(info)}'
 
 
 def image_dimensions(data):
@@ -987,12 +1130,65 @@ def image_dimensions(data):
     return None
 
 
-def probe_image_size(url):
+def public_https(url):
+    """True si la URL es https y su host resuelve solo a direcciones públicas."""
     try:
-        request=urllib.request.Request(url,headers={'User-Agent':'MigueloteScan/1.0','Range':'bytes=0-65535'})
-        with urllib.request.urlopen(request,timeout=2) as response:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != 'https' or not parsed.hostname or parsed.username:
+            return False
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or 443, proto=socket.IPPROTO_TCP)
+        return bool(infos) and all(ipaddress.ip_address(info[4][0].split('%')[0]).is_global for info in infos)
+    except (OSError, ValueError):
+        return False
+
+
+class PublicRedirect(urllib.request.HTTPRedirectHandler):
+    """Sigue redirecciones solo hacia https públicos."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not public_https(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class PublicHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        addresses = socket.getaddrinfo(self.host, self.port, type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(row[4][0].split('%')[0]).is_global
+                                for row in addresses):
+            raise OSError('Destino de imagen no público.')
+        # Connect to the validated address, but verify TLS against the original hostname.
+        family, kind, proto, _, address = addresses[0]
+        sock = socket.socket(family, kind, proto)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(address)
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except Exception:
+            sock.close()
+            raise
+
+
+class PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(PublicHTTPSConnection, req)
+
+
+IMAGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                          PublicRedirect, PublicHTTPSHandler)
+
+
+
+def probe_image_size(url):
+    # Las URLs de imagen las controla el creador del token: nunca se consultan hosts internos.
+    if not public_https(url):
+        return None
+    try:
+        request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT, 'Range': 'bytes=0-65535'})
+        with IMAGE_OPENER.open(request, timeout=2) as response:
             return image_dimensions(response.read(65536))
-    except (OSError,ValueError):return None
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
 
 
 def image_quality(size):
@@ -1017,7 +1213,10 @@ def image_url(value):
 def safe_link(label, url):
     if not isinstance(url,str) or len(url)>2048:
         return None
-    parsed=urllib.parse.urlsplit(url)
+    try:
+        parsed=urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
     if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username:
         return None
     return f'<a href="{html.escape(url,quote=True)}">{esc(label)}</a>'
@@ -1033,27 +1232,25 @@ def age_text(timestamp, now):
     return str(int(seconds//60))+'m'
 
 
-def activity_lines(pair,now):
+def caption_length(text):
+    """Longitud visible del texto en unidades UTF-16 (límite del pie de foto de Telegram)."""
+    return len(html.unescape(re.sub(r'<[^>]+>','',text)).encode('utf-16-le'))//2
+
+
+def activity_lines(pair):
     extra=pair.get('activity_extra') or (pair if pair.get('source')=='DexScreener' else {})
-    txns=extra.get('txns') if isinstance(extra.get('txns'),dict) else {}
-    def count(value):
-        n=number(value)
-        return compact(n) if n is not None and n>=0 and n.is_integer() else '—'
-    def transactions(window):
-        tx=txns.get(window) if isinstance(txns.get(window),dict) else {}
-        return count(tx.get('buys'))+' / '+count(tx.get('sells'))
     liq=number((pair.get('liquidity') or {}).get('usd'))
     mc=number(pair.get('marketCap'))
     volume=number((pair.get('volume') or {}).get('h24'))
     liquidity_ratio=f'{100*liq/mc:.2f}%' if liq is not None and liq>=0 and mc is not None and mc>0 else '—'
     turnover=f'{volume/liq:.2f}×' if volume is not None and volume>=0 and liq is not None and liq>0 else '—'
     boosts=extra.get('boosts') if isinstance(extra.get('boosts'),dict) else {}
-    created=number(extra.get('pairCreatedAt'))
-    age=age_text(created/1000 if created else None,now)
-    return ['', '⚡ <b>ACTIVIDAD DEL PAR</b>',
+    active=number(boosts.get('active'))
+    boost_text=compact(active) if active is not None and active>=0 and active.is_integer() else '—'
+    return ['⚡ <b>ACTIVIDAD DEL PAR</b>',
             f'├ LIQ/MC: <b>{liquidity_ratio}</b>',
             f'├ VOL/LIQ 24h: <b>{turnover}</b>',
-            f'└ Boosts DEX: <b>{count(boosts.get("active"))}</b>']
+            f'└ Boosts DEX: <b>{boost_text}</b>']
 
 
 def comparison_snapshot(mint,pair,fetched,info):
@@ -1090,7 +1287,7 @@ def audit_summary(chain,sources,market=None):
     if score is None:
         value='⚪ <b>—</b>'
     else:
-        color='🟢' if score>=70 else '🟠' if score>=40 else '🔴'
+        color='🟢' if score>=SCORE_OK else '🟠' if score>=SCORE_WARN else '🔴'
         value=f'{color} <b>{score}/100</b>'
         if result['verdict']=='RIESGO CRÍTICO':value+=' · ⚠️ Crítico'
     return '🛡️ <b>AUDIT '+label.upper()+'</b>: '+value+' · Índice SCAN'
@@ -1100,7 +1297,7 @@ def bold_metric(text):
     return re.sub(r'(?<![\w>])(?:[0-9]+(?:\.[0-9]+)?%|—)',r'<b>\g<0></b>',text)
 
 
-def card(mint, pair, fetched, info=None, gmgn_note=''):
+def card(mint, pair, fetched, info=None):
     base=pair.get('baseToken') or {}
     info=info or pair.get('gmgn_info') or {}
     stat=info.get('stat') or {}
@@ -1109,16 +1306,16 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     tx=(pair.get('txns') or {}).get('h24') or {}
     current=number(pair.get('priceUsd'))
     ath=number(info.get('ath_price'))
-    chain=pair.get('chainId','solana')
+    chain=pair.get('chainId') or 'solana'
     ratio=lambda v:fmt(v,ratio=True) if number(v) is not None and 0<=number(v)<=1 else '—'
     short=lambda v: (v[:6]+'…'+v[-4:]) if valid_contract(v) else '—'
     supply=number(info.get('total_supply'))
     supply_text=compact(supply) if supply is not None and supply>=0 else '—'
     age=age_text(info.get('creation_timestamp'),fetched)
-    name=esc(base.get('name','Token'),45)
-    symbol=esc(base.get('symbol','?'),18)
+    name=esc(base.get('name') or 'Token',45)
+    symbol=esc(base.get('symbol') or '?',18)
     lines=[f'<b>{name} (${symbol})</b>',
-           f'{esc(chain.title())} · {esc(pair.get("dexId","DEX"),25)} · 🌱 {age}', '',
+           f'{esc(chain.title())} · {esc(pair.get("dexId") or "DEX",25)} · 🌱 {age}',
            '🟩 <b>TOKEN STATS</b>',
            f'├ Capitalización: <b>{compact(pair.get("marketCap"),True)}</b>',
            f'├ Supply total: <b>{supply_text}</b>',
@@ -1128,7 +1325,7 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
            f'├ 5 min: <b>{change(changes.get("m5"))}</b> · 1 hora: <b>{change(changes.get("h1"))}</b>',
            f'├ 24 horas: <b>{change(changes.get("h24"))}</b>',
            f'├ Compras / Ventas: <b>{compact(tx.get("buys"))} / {compact(tx.get("sells"))}</b> (24 horas)',
-           f'└ Holders: <b>{compact(info.get("holder_count"))}</b>', '',
+           f'└ Holders: <b>{compact(info.get("holder_count"))}</b>',
            '🏔 <b>ATH</b>']
     if ath is not None and ath>0 and (current is None or current<=ath):
         lines += [f'├ Precio: <b>{fmt(ath,money=True)}</b>',f'├ {ath_mc(info)}']
@@ -1136,13 +1333,13 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
         lines += [f'└ Desde ATH: <b>{change(drop)}</b>']
     else:
         lines += ['└ <b>—</b>']
-    lines+=activity_lines(pair,fetched)
-    lines += ['', audit_summary(chain,pair.get('security_sources') or {},pair), '🟦 <b>DISTRIBUCIÓN</b>',
+    lines+=activity_lines(pair)
+    lines += [audit_summary(chain,pair.get('security_sources') or {},pair), '🟦 <b>DISTRIBUCIÓN</b>',
               f'👥 Top 10: <b>{ratio(stat.get("top_10_holder_rate"))}</b>',
               '🎯 '+bold_metric(pair.get('sniper_text','🎯 Snipers —').replace('🎯 ','')),
               '📦 '+bold_metric(pair.get('bundler_text','Bundled —').replace('🎯 ','')),
               f'🧑‍💻 Equipo: <b>{ratio(stat.get("dev_team_hold_rate"))}</b>',
-              '', f'Par: <b>{short(pair.get("pairAddress"))}</b>',
+              f'Par: <b>{short(pair.get("pairAddress"))}</b>',
               f'DEV: <b>{short(dev.get("creator_address"))}</b>',
               'Ventas del DEV: <b>'+pair.get('dev_sell_text','⚪ Sin verificar')+'</b>']
     aser_position=len(lines)
@@ -1154,15 +1351,14 @@ def card(mint, pair, fetched, info=None, gmgn_note=''):
     username=social.get('twitter_username')
     if isinstance(username,str) and re.fullmatch(r'@?[A-Za-z0-9_]{1,15}',username):
         links.append(safe_link('X','https://x.com/'+username.lstrip('@')))
-    if links: lines += ['', '🌐 <b>SOCIALS</b>', ' · '.join(links)]
+    if links: lines += ['🌐 <b>SOCIALS</b>', ' · '.join(links)]
     lines += [f'<code>{mint}</code>','<i>🔄 <b>ÚLTIMA CONSULTA</b>: <b>'+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</b></i>']
     text='\n'.join(line for line in lines if line)
     summary=aser_summary(pair.get('aser_signals'))
     if summary:
         position=aser_position
         extended='\n'.join(line for line in lines[:position]+[summary]+lines[position:] if line)
-        visible=html.unescape(re.sub(r'<[^>]+>','',extended))
-        if len(visible.encode('utf-16-le'))//2<=1024:text=extended
+        if caption_length(extended)<=CAPTION_LIMIT:text=extended
     return text
 
 
@@ -1172,12 +1368,13 @@ def sources_text(pair, fetched, gmgn_note=''):
              'Precio y actividad: GMGN. Variaciones calculadas con sus precios al inicio de cada período. Liquidez del pool principal indicado por GMGN.',
              'Holders, Top 10 y etiquetas sniper: GMGN cuando está disponible. Una etiqueta no prueba que sea un bot.',
              'ATH de precio: reportado por GMGN. MC al precio ATH marcado ≈ es una estimación con suministro circulante actual, no el MC histórico. Snipers: suma de participaciones de holders etiquetados por GMGN, consulta limitada a 100 carteras; una lista de 100 es parcial.',
-             'Actividad del par: C/V son cantidades de compras/ventas, no dólares ni personas únicas. Ventanas 5m y 1h, edad del par y boosts: DexScreener, solo para el mismo pool y red. Boosts son promoción, no garantía de calidad. LIQ/MC = liquidez / capitalización × 100; VOL/LIQ = volumen 24h / liquidez. Son relaciones descriptivas, no medidas de seguridad.',
+             'Compras / Ventas: cantidad de operaciones en 24 horas, no dólares ni personas únicas. Actividad del par: LIQ/MC = liquidez / capitalización × 100; VOL/LIQ = volumen 24h / liquidez. Boosts DEX: promociones activas según DexScreener, solo para el mismo pool y red; son promoción, no garantía de calidad. Son relaciones descriptivas, no medidas de seguridad.',
              'DEV SELL: cartera creadora identificada por GMGN. Sí indica estado sell en token info o una venta del token en su historial de actividad. No detectado indica que la consulta filtrada por ventas devuelve una lista vacía sin más páginas; no certifica que nunca vendió ni cubre otras carteras del equipo, transferencias o ventas fuera del historial del proveedor. No es una valoración de seguridad. Sin verificar significa que faltan datos o no se pudo consultar.',
              'Desde la consulta anterior compara la última ficha enviada o editada con éxito en ese mensaje. Si el servidor pierde el registro local, la comparación comienza en la siguiente actualización. Cambios de proveedor o pool se muestran como — para no mezclar referencias.',
-             'Edad: fecha de creación del token según GMGN; no se sustituye por la edad del pool. Equipo: suministro en carteras etiquetadas como equipo. No se calcula una puntuación de auditoría ni se equipara volumen de bundlers con suministro retenido. Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
+             'AUDIT: índice SCAN (0–100) calculado por Miguelote Scan con GoPlus, Honeypot.is y RugCheck según la red; no es una nota del proveedor, ni una auditoría, ni un consejo de inversión. — significa datos insuficientes. El botón Escáner muestra el detalle.',
+             'Edad: fecha de creación del token según GMGN; no se sustituye por la edad del pool. Equipo: suministro en carteras etiquetadas como equipo. No se equipara volumen de bundlers con suministro retenido. Bubble Maps abre el mapa externo si el proyecto tiene cobertura.']
     lines.append('ASER: señales y tesis devueltas para el contrato exacto en Solana. Las tesis son opiniones de usuarios, no señales oficiales. La primera call es la señal más antigua del historial devuelto por ASER, no la primera publicación del grupo ni una garantía de cobertura histórica completa. No implica que fuera una recomendación de compra. Si falta espacio bajo la imagen, el resumen queda en el botón ASER. Caché de hasta 60 segundos; Actualizar renueva la consulta salvo pausa por errores o cuota.')
-    created = number(pair.get('pairCreatedAt'))
+    created = number((pair.get('activity_extra') or pair).get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
         lines.append(f'Creación del par (no del token): {stamp(created / 1000)}')
     if gmgn_note:
@@ -1187,17 +1384,19 @@ def sources_text(pair, fetched, gmgn_note=''):
     return '\n\n'.join(lines)
 
 
-def holders_text(data, chain='solana'):
+def holders_text(data):
     rows = data.get('list')
     if not isinstance(rows, list):
         raise DataError('Lista de holders no disponible en GMGN.')
     lines = ['<b>Top holders · reportado por GMGN</b>']
-    for index, row in enumerate(rows[:10], 1):
-        addr = row.get('address')
-        if not valid_contract(addr):
+    for row in rows:
+        if len(lines) > 10:
+            break
+        if not isinstance(row, dict) or not valid_contract(row.get('address')):
             continue
+        addr = row['address']
         kind = 'Exchange / pool' if row.get('addr_type') == 2 else 'Sin clasificar'
-        lines.append(f'{index}. <code>{addr[:6]}…{addr[-4:]}</code> '
+        lines.append(f'{len(lines)}. <code>{addr[:6]}…{addr[-4:]}</code> '
                      f'· {fmt(row.get("amount_percentage"), ratio=True)} · {fmt(row.get("balance"))} tokens · {kind}')
     if len(lines) == 1:
         lines.append('No hay filas válidas disponibles; no implica cero holders.')
@@ -1211,6 +1410,7 @@ HELP = ('<b>Miguelote Scan · Multired</b>\n'
         '/chart — elegir DexScreener o DEXTools\n'
         '/holders CONTRATO — top holders GMGN\n'
         '/snipers CONTRATO — detección GMGN\n'
+        '/security CONTRATO — escáner de riesgos\n'
         '/ath CONTRATO — máximo del historial disponible\n\n'
         'Los charts se abren en el navegador. Bubble Maps depende de cobertura externa. '
         'Datos: GMGN. ATH de precio reportado por el proveedor; no certificado independientemente.')
@@ -1221,11 +1421,26 @@ class Bot:
         self.token, self.scanner = token, scanner
         self.allowed = allowed or set()
         self.last_request = {}
+        self.username = None
+        self.lock = threading.RLock()
+        self.callback_lock = threading.Lock()
+        self._delivery_snapshot = None
 
     def api(self, method, payload):
-        response = fetch(f'https://api.telegram.org/bot{self.token}/{method}', payload, timeout=40)
+        try:
+            response = fetch(f'https://api.telegram.org/bot{self.token}/{method}', payload,
+                             timeout=40 if method == 'getUpdates' else 12)
+        except RateLimitError as error:
+            if method in ('sendMessage', 'sendPhoto', 'editMessageText', 'editMessageCaption'):
+                raise DeliveryRetryError(method, payload, error.retry_after) from None
+            raise
+        if isinstance(response, dict) and response.get('error_code') == 429:
+            delay = number((response.get('parameters') or {}).get('retry_after')) or 30
+            if method in ('sendMessage', 'sendPhoto', 'editMessageText', 'editMessageCaption'):
+                raise DeliveryRetryError(method, payload, delay)
+            raise RateLimitError('Telegram: límite de consultas.', delay)
         if not isinstance(response, dict) or not response.get('ok'):
-            raise DataError('Telegram rechazó la petición; revisa configuración y permisos.')
+            raise TelegramRequestError('Telegram rechazó la petición; revisa configuración y permisos.', response.get('error_code') if isinstance(response, dict) else None)
         return response.get('result')
 
     def send(self, chat, text, markup=None):
@@ -1242,24 +1457,39 @@ class Bot:
             if not sharp and fallback:
                 logos,_=self.scanner.rank_images(logos+fallback())
                 fallback=None
-        sent_photo=False
+        fits = caption_length(text) <= CAPTION_LIMIT
+        sent_photo = limited = False
         for logo in logos:
             if not isinstance(logo,str) or not logo.startswith('https://') or len(logo)>=2048:
                 continue
             payload = {'chat_id': chat, 'photo': logo}
-            visible = html.unescape(re.sub(r'<[^>]+>', '', text))
-            fits = len(visible.encode('utf-16-le')) // 2 <= 1024
             if fits:
-                payload.update(caption=text, parse_mode='HTML', reply_markup=markup)
+                payload.update(caption=text, parse_mode='HTML')
+                if markup:
+                    payload['reply_markup'] = markup
             try:
                 result = self.api('sendPhoto', payload)
-                if fits:
-                    return result
-                sent_photo=True
-                break
+            except DeliveryRetryError as error:
+                if not fits:
+                    message = {'chat_id': chat, 'text': text, 'parse_mode': 'HTML',
+                               'link_preview_options': {'is_disabled': True}}
+                    if markup:
+                        message['reply_markup'] = markup
+                    error.steps.append({'method': 'sendMessage', 'payload': message})
+                raise
+            except RateLimitError:
+                raise
+            except TelegramRequestError as error:
+                if error.status == 400:
+                    continue  # rejected image: try a reserve URL
+                raise  # unknown delivery outcome or permission error: never send another photo
             except DataError:
                 continue
-        if not sent_photo and fallback:
+            if fits:
+                return result
+            sent_photo = True
+            break
+        if not sent_photo and fallback and not limited:
             return self.send_card(chat,text,markup,fallback())
         return self.send(chat, text, markup)
 
@@ -1268,17 +1498,27 @@ class Bot:
                  'parse_mode':'HTML','reply_markup':markup}
         if msg.get('photo'):
             # Keep the existing image. Never post a replacement card after an edit failure.
-            visible=html.unescape(re.sub(r'<[^>]+>','',text))
-            if len(visible.encode('utf-16-le'))//2>1024:
+            if caption_length(text)>CAPTION_LIMIT:
                 raise DataError('La ficha actualizada supera el espacio de esta foto. Se conserva la anterior.')
             payload['caption']=text
             return self.api('editMessageCaption',payload)
         payload.update(text=text,link_preview_options={'is_disabled':True})
         return self.api('editMessageText',payload)
 
-    def callback_notice(self,callback,text):
-        try:return self.api('answerCallbackQuery',{'callback_query_id':callback['id'],'text':text[:180],'show_alert':True})
-        except DataError:return None
+    def callback_notice(self, callback, text=None, alert=True):
+        if not isinstance(callback, dict):
+            return None
+        with self.callback_lock:
+            if callback.get('_answered'):
+                return None
+            callback['_answered'] = True
+        try:
+            payload = {'callback_query_id': callback['id']}
+            if text:
+                payload.update(text=text[:180], show_alert=alert)
+            return self.api('answerCallbackQuery', payload)
+        except Exception:
+            return None
 
     def network_keyboard(self, chat, mint, pair, user):
         chain=self.scanner.chain
@@ -1314,6 +1554,108 @@ class Bot:
                                         {'text': 'DEXTools', 'callback_data': 'pref:dextools'}]]})
 
     def handle(self, update):
+        """Permanent/malformed failures cannot poison the queue; 429 deliveries remain pending."""
+        if not isinstance(update, dict):
+            return
+        with self.lock:
+            self._delivery_snapshot = None
+            callback = update.get('callback_query')
+            timer = None
+            key = 'delivery:' + str(update['update_id']) if type(update.get('update_id')) is int else None
+            store = self.scanner.store
+            try:
+                pending = store.get(key) if key else None
+                if pending:
+                    return self._resume_delivery(key, json.loads(pending))
+                if callback:
+                    callback.pop('_answered', None)
+                    # Quick errors can still show their specific notice; slow requests get an ACK.
+                    timer = threading.Timer(3, self.callback_notice,
+                                            args=(callback, 'Procesando…', False))
+                    timer.daemon = True
+                    timer.start()
+                return self._handle(update)
+            except DeliveryRetryError as error:
+                if key and not store.get(key):
+                    store.put(key, json.dumps({'steps': error.steps,
+                              'retry_at': time.time() + error.retry_after,
+                              'snapshot': self._delivery_snapshot}))
+                self.callback_notice(callback, 'Telegram pide esperar; se reintentará automáticamente.')
+                raise
+            except Exception as error:
+                # Never log provider bodies, URLs, tokens, or user content.
+                print('Error en update ' + str(update.get('update_id')) + ': ' + type(error).__name__, flush=True)
+                self._report_failure(update)
+            finally:
+                if timer:
+                    timer.cancel()
+                self.callback_notice(callback)
+                self._delivery_snapshot = None
+
+    def _resume_delivery(self, key, pending):
+        """Retry exact unsent operations, not market queries or already-sent photos."""
+        remaining = pending['retry_at'] - time.time()
+        if remaining > 0:
+            first = pending['steps'][0]
+            raise DeliveryRetryError(first['method'], first['payload'], remaining)
+        store = self.scanner.store
+        result = None
+        while pending['steps']:
+            step = pending['steps'][0]
+            try:
+                result = self.api(step['method'], step['payload'])
+            except DeliveryRetryError as error:
+                pending['retry_at'] = time.time() + error.retry_after
+                store.put(key, json.dumps(pending))
+                raise
+            except DataError:
+                # Unknown network outcome: do not blindly repeat a possibly delivered message.
+                store.delete(key)
+                raise
+            pending['steps'].pop(0)
+            pending['result'] = result
+            store.put(key, json.dumps(pending))
+        snapshot = pending.get('snapshot')
+        result = pending.get('result', result)
+        if snapshot:
+            message_id = snapshot.get('message_id') or (result.get('message_id') if isinstance(result, dict) else None)
+            if message_id:
+                store.card_snapshot(snapshot['chat'], message_id, snapshot['value'])
+        store.delete(key)
+        return result
+
+    def _report_failure(self, update):
+        callback = update.get('callback_query')
+        if callback:
+            self.callback_notice(callback, 'No se pudo completar. Se conserva la ficha anterior.')
+            return
+        try:
+            msg = update.get('message') or {}
+            chat = (msg.get('chat') or {}).get('id')
+            if chat is None or (self.allowed and chat not in self.allowed):
+                return
+            self.send(chat, '⚠️ No se pudo completar la consulta. Inténtalo de nuevo en unos segundos.')
+        except Exception:
+            pass
+
+    def housekeeping(self):
+        """Acota memoria: peticiones recientes por usuario y caché del escáner."""
+        if len(self.last_request) > 1000:
+            cutoff = time.monotonic() - 3600
+            self.last_request = {k: v for k, v in self.last_request.items() if v > cutoff}
+        prune = getattr(self.scanner, 'prune', None)
+        if prune:
+            prune()
+
+    def own_username(self):
+        if self.username is None:
+            try:
+                self.username = (self.api('getMe', {}) or {}).get('username') or ''
+            except DataError:
+                return None
+        return self.username or None
+
+    def _handle(self, update):
         callback = update.get('callback_query')
         msg = (callback or {}).get('message') if callback else update.get('message')
         if not msg or 'chat' not in msg:
@@ -1322,16 +1664,19 @@ class Bot:
         if self.allowed and chat not in self.allowed:
             return
         user = ((callback or msg).get('from') or {}).get('id', chat)
+        self.housekeeping()
         if callback:
-            try:self.api('answerCallbackQuery', {'callback_query_id': callback['id']})
-            except DataError:pass
-            action, _, arg = callback.get('data', '').partition(':')
+            action, _, arg = (callback.get('data') or '').partition(':')
         else:
             text = (msg.get('text') or msg.get('caption') or '').strip()
             if text.startswith('/'):
-                first, _, arg = text.partition(' ')
-                action = first.split('@')[0][1:].lower()
-            elif valid_contract(text) or re.fullmatch(r'[a-z0-9-]+:[A-Za-z0-9]+',text):
+                parts = text.split(None, 1)
+                command, _, mention = parts[0].partition('@')
+                if mention and mention.lower() != (self.own_username() or '').lower():
+                    return  # comando dirigido a otro bot del grupo
+                action = command[1:].lower()
+                arg = parts[1].strip() if len(parts) > 1 else ''
+            elif valid_contract(text) or network_contract(text):
                 action, arg = 'scan', text
             else:
                 candidates = re.findall(r'(?<![A-Za-z0-9])(?:0x[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?|[1-9A-HJ-NP-Za-km-z]{32,44})(?![A-Za-z0-9])', text)
@@ -1369,7 +1714,8 @@ class Bot:
             'Actualizar' in b.get('text','')
             for row in (msg.get('reply_markup') or {}).get('inline_keyboard',[]) for b in row))
         if action == 'missingpool':
-            return self.send(chat, 'GMGN no ha devuelto un pool válido para abrir este gráfico. Puedes usar el botón GMGN.')
+            message = 'GMGN no ha devuelto un pool válido para abrir este gráfico. Puedes usar el botón GMGN.'
+            return self.callback_notice(callback, message) if callback else self.send(chat, message)
         if action in ('start', 'help'):
             return self.send(chat, HELP)
         if action in ('chart', 'settings'):
@@ -1383,11 +1729,14 @@ class Bot:
                 return self.send(chat, 'Preferencia guardada para tus próximas consultas.')
             return
         if action not in ('scan', 'ath', 'holders', 'snipers', 'sources', 'security', 'srefresh', 'aser'):
-            return self.send(chat, HELP)
+            # Solo en privado se responde a comandos desconocidos; en grupos pueden ser de otros bots.
+            if not callback and msg['chat'].get('type') == 'private':
+                return self.send(chat, HELP)
+            return None
         chain = None
         if arg.startswith('ref_'):
             ref=self.scanner.store.reference(key=arg[4:])
-            if not ref and (refreshing or action in ('security','srefresh','aser')):
+            if not ref and callback:
                 # Old buttons refer to local state, which Render may discard on restart.
                 body=msg.get('text') or msg.get('caption') or ''
                 addresses=[line.strip() for line in body.splitlines() if valid_contract(line.strip())]
@@ -1395,12 +1744,12 @@ class Bot:
                 if len(addresses)==1 and network:
                     ref={'chat':chat,'chain':network.group(1).lower(),'mint':addresses[0]}
             if not ref or ref.get('chat') != chat:
-                if refreshing:return self.callback_notice(callback,'Esta ficha ha caducado. Envía de nuevo el contrato.')
-                return self.send(chat,'Esta ficha ha caducado. Envía de nuevo el contrato.')
+                message='Esta ficha ha caducado. Envía de nuevo el contrato.'
+                return self.callback_notice(callback,message) if callback else self.send(chat,message)
             chain,arg=ref['chain'],ref['mint']
         elif ':' in arg:
             chain,arg=arg.split(':',1)
-            chain={'sol':'solana','eth':'ethereum','bnb':'bsc'}.get(chain.lower(),chain.lower())
+            chain=canonical_chain(chain)
         if not valid_contract(arg):
             return self.send(chat,'Formato no reconocido. Usa /scan RED:CONTRATO con la dirección completa.')
         arg=normalized(arg)
@@ -1428,32 +1777,25 @@ class Bot:
                 raise DataError('Red no válida.')
             if chain=='solana' and not valid_address(arg):
                 raise DataError('El contrato no tiene formato Solana.')
+        except DeliveryRetryError:
+            raise
         except DataError as error:
             return self.send(chat,esc(str(error),500))
         self.scanner.chain=chain
         if time.monotonic() - self.last_request.get(user, -100) < 3:
-            if refreshing:return self.callback_notice(callback,'Espera unos segundos antes de actualizar.')
-            return self.send(chat, 'Espera unos segundos antes de la siguiente consulta.')
+            message = 'Espera unos segundos antes de la siguiente consulta.'
+            return self.callback_notice(callback, message) if callback else self.send(chat, message)
         self.last_request[user] = time.monotonic()
+        if callback and not refreshing:
+            self.callback_notice(callback)  # quita el indicador de carga del botón
         try:
             if action == 'scan':
                 pair, _, fetched = (self.scanner.refresh_market(arg) if refreshing else self.scanner.market(arg))
-                pair = self.scanner.enrich_activity(arg,pair)
-                info = pair['gmgn_info']
-                pair['security_sources']=self.scanner.security_evidence(chain,arg,force=refreshing)
-                try:
-                    pair['sniper_text'] = self.scanner.current_snipers(arg)
-                except DataError:
-                    pair['sniper_text'] = '🎯 Snipers —'
-                try:
-                    pair['bundler_text']=self.scanner.current_tag_holdings(arg,'bundler')
-                except DataError:
-                    pair['bundler_text']='Bundled —'
-                pair['dev_sell_text']=self.scanner.dev_sell(arg,info)
-                if chain=='solana':
-                    try:pair['aser_signals']=self.scanner.aser_signals(arg)
-                    except DataError:pass
+                pair, logos = self.scanner.card_inputs(arg, pair, refreshing)
+                info = pair.get('gmgn_info') or {}
                 current=comparison_snapshot(arg,pair,fetched,info)
+                self._delivery_snapshot = {'chat': chat, 'value': current,
+                                           'message_id': msg.get('message_id') if refreshing else None}
                 text=card(arg,pair,fetched,info)
                 markup=self.network_keyboard(chat,arg,pair,user)
                 if refreshing:
@@ -1463,7 +1805,7 @@ class Bot:
                     if result:
                         self.scanner.store.card_snapshot(chat,msg['message_id'],current)
                     return result
-                result=self.send_card(chat,text,markup,self.scanner.images(arg,info),
+                result=self.send_card(chat,text,markup,logos,
                                       fallback=lambda:self.scanner.extra_images(arg))
                 if isinstance(result,dict) and result.get('message_id'):
                     self.scanner.store.card_snapshot(chat,result['message_id'],current)
@@ -1498,50 +1840,96 @@ class Bot:
             if action == 'ath':
                 return self.send(chat, self.scanner.history(arg))
             if action == 'holders':
-                return self.send(chat, holders_text(self.scanner.gmgn_query('holders', arg),chain))
+                return self.send(chat, holders_text(self.scanner.gmgn_query('holders', arg)))
             if action == 'snipers':
                 return self.send(chat, self.scanner.current_snipers(arg) +
                                  '\nParticipación actual del suministro en carteras etiquetadas. GMGN: hasta 100 carteras; Aser: solo lecturas completas y recientes. No mide las compras al lanzamiento.\n' +
                                  f'Consulta/caché de hasta 60 s · {stamp(time.time())}')
+        except DeliveryRetryError:
+            raise
         except DataError as error:
             if refreshing:return self.callback_notice(callback,'No se pudo actualizar: '+str(error))
             return self.send(chat, esc(str(error), 500))
 
+    def ensure_polling(self):
+        """getUpdates no funciona con un webhook activo (error 409)."""
+        try:
+            info = self.api('getWebhookInfo', {}) or {}
+        except DataError:
+            return
+        if not info.get('url'):
+            return
+        if os.environ.get('DELETE_WEBHOOK') == '1':
+            self.api('deleteWebhook', {})
+            print('Webhook eliminado; el bot usará long polling.', flush=True)
+            return
+        raise SystemExit('Este bot tiene un webhook activo y no se puede usar a la vez con getUpdates. '
+                         'Ejecútalo en modo webhook o arranca con DELETE_WEBHOOK=1 para pasar a polling.')
+
     def run(self):
-        self.api('getMe', {})
+        self.username = (self.api('getMe', {}) or {}).get('username') or ''
+        self.ensure_polling()
         print('Bot iniciado. Pulsa Ctrl+C para detenerlo.', flush=True)
         offset = self.scanner.store.offset()
+        next_prune = time.monotonic() + 86400
         while True:
             try:
                 updates = self.api('getUpdates', {'offset': offset, 'timeout': 25,
                                    'allowed_updates': ['message', 'callback_query']})
-                for update in updates:
-                    self.handle(update)
-                    offset = update['update_id'] + 1
-                    self.scanner.store.offset(offset)
-            except DataError:
-                print('Servicio temporalmente no disponible. Reintento en 10 s.', flush=True)
+            except RateLimitError as error:
+                print('Telegram pide esperar ' + str(int(error.retry_after)) + ' s.', flush=True)
+                time.sleep(min(max(error.retry_after, 1), 300))
+                continue
+            except DataError as error:
+                print('Servicio temporalmente no disponible: ' + str(error) + ' Reintento en 10 s.', flush=True)
                 time.sleep(10)
+                continue
+            for update in updates or []:
+                try:
+                    self.handle(update)
+                except DeliveryRetryError as error:
+                    time.sleep(min(error.retry_after, 30))
+                    break  # keep offset: the exact pending delivery is retried next poll
+                offset = update['update_id'] + 1
+                self.scanner.store.offset(offset)
+            if time.monotonic() >= next_prune:
+                self.scanner.store.prune()
+                next_prune = time.monotonic() + 86400
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--scan', help='Consultar sin Telegram; requiere GMGN')
+    parser.add_argument('--scan', help='Consultar sin Telegram (GMGN si está activo; si no, DexScreener/GeckoTerminal)')
+    parser.add_argument('--chain', default='solana', help='Red para --scan: solana, ethereum, base, bsc…')
     args = parser.parse_args()
     store = Store(os.environ.get('BOT_DB', 'veraz.sqlite3'))
     scanner = Scanner(store, gmgn=os.environ.get('ENABLE_GMGN') == '1')
     if args.scan:
+        if not valid_contract(args.scan):
+            parser.exit(1, 'Contrato no válido.\n')
+        scanner.chain = canonical_chain(args.chain)
+        mint = normalized(args.scan)
         try:
-            pair, _, fetched = scanner.market(args.scan)
-            print(card(args.scan, pair, fetched))
-            print(json.dumps(keyboard(args.scan, pair['pairAddress']), ensure_ascii=False, indent=2))
+            pair, _, fetched = scanner.market(mint)
+            print(card(mint, pair, fetched))
+            print(json.dumps(keyboard(mint, pair.get('pairAddress')), ensure_ascii=False, indent=2))
         except DataError as error:
             parser.exit(1, f'{error}\n')
         return
     token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
     if not re.fullmatch(r'\d+:[A-Za-z0-9_-]+', token):
         parser.exit(1, 'Falta TELEGRAM_BOT_TOKEN. Ejecuta python iniciar.py para introducirlo de forma privada.\n')
-    allowed = {int(x.strip()) for x in os.environ.get('ALLOWED_CHAT_IDS', '').split(',') if x.strip()}
+    allowed = set()
+    for item in os.environ.get('ALLOWED_CHAT_IDS', '').split(','):
+        if not item.strip():
+            continue
+        try:
+            allowed.add(int(item.strip()))
+        except ValueError:
+            # Falla cerrado: un valor mal escrito no debe dejar el bot abierto a todo el mundo.
+            parser.exit(1, 'ALLOWED_CHAT_IDS debe contener solo ids numéricos separados por comas.\n')
+    if not allowed:
+        print('AVISO: ALLOWED_CHAT_IDS está vacío; cualquiera puede usar este bot y gastar tu cuota de GMGN.', flush=True)
     try:
         Bot(token, scanner, allowed).run()
     except KeyboardInterrupt:
@@ -1550,4 +1938,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
