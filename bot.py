@@ -339,7 +339,7 @@ class Scanner:
                 raise DataError('GoPlus sin cobertura confirmada para esta combinación red/contrato.')
             key_value=os.environ.get('GOPLUS_ACCESS_TOKEN','').strip()
             headers={'Authorization':'Bearer '+key_value} if key_value else None
-            data=(fetch(url,timeout=6,extra_headers=headers) if self.transport is fetch else self.transport(url))
+            data=(fetch(url,timeout=10,extra_headers=headers) if self.transport is fetch else self.transport(url))
             if not isinstance(data,dict) or str(data.get('code'))!='1':
                 raise DataError('GoPlus no devolvió información de seguridad válida.')
             result=data.get('result')
@@ -352,7 +352,7 @@ class Scanner:
                 raise DataError('Honeypot.is no verifica esta red.')
             cid={'ethereum':1,'bsc':56,'base':8453}[chain]
             url=f'https://api.honeypot.is/v2/IsHoneypot?address={address}&chainID={cid}'
-            data=(fetch(url,timeout=6) if self.transport is fetch else self.transport(url))
+            data=(fetch(url,timeout=10) if self.transport is fetch else self.transport(url))
             if not isinstance(data,dict) or not isinstance(data.get('token'),dict) or not same_token(data['token'].get('address'),mint):
                 raise DataError('Honeypot.is no confirmó el contrato consultado.')
             match=data
@@ -360,7 +360,7 @@ class Scanner:
             if chain!='solana' or not valid_address(mint):
                 raise DataError('RugCheck solo se consulta para tokens de Solana.')
             url=f'https://api.rugcheck.xyz/v1/tokens/{address}/report/summary'
-            match=(fetch(url,timeout=6) if self.transport is fetch else self.transport(url))
+            match=(fetch(url,timeout=10) if self.transport is fetch else self.transport(url))
             if not isinstance(match,dict) or not any(k in match for k in ('risks','score','lpLockedPct','tokenProgram')):
                 raise DataError('RugCheck no devolvió un informe verificable.')
         else:
@@ -603,16 +603,19 @@ class Scanner:
     def market(self, mint):
         try:
             return self.gmgn_market(mint)
-        except DataError:pass
+        except DataError as error:
+            gmgn_error = str(error)
         try:
             rows=[p for p in self.dex_pairs(mint) if p['chainId']==self.chain]
             if rows:
                 pair=dict(max(rows,key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0))
-                pair.update(gmgn_info={},source='DexScreener')
+                pair.update(gmgn_info={},source='DexScreener',gmgn_error=gmgn_error)
                 return pair,rows,self.cache[('dex',normalized(mint))][0]
         except DataError:pass
         try:
-            return self.gecko_market(mint)
+            pair, rows, fetched = self.gecko_market(mint)
+            pair = dict(pair, gmgn_error=gmgn_error)
+            return pair, rows, fetched
         except DataError:
             raise DataError('No se pudo obtener el mercado de este contrato en '+self.chain+'. Los proveedores no responden o no tienen cobertura. Reinténtalo más tarde.') from None
 
@@ -658,8 +661,10 @@ class Scanner:
         return pair, [pair], fetched
 
     def gmgn_query(self, command, mint, wallet=None):
-        # Keep the existing request pacing; concurrency must not burst the GMGN quota.
-        return self._gmgn_query(command, mint, wallet)
+        # CLI processes are CPU-heavy on small instances: keep GMGN serialized.
+        # Independent HTTP providers still run concurrently.
+        with self.gmgn_lock:
+            return self._gmgn_query(command, mint, wallet)
 
     def _gmgn_query(self, command, mint, wallet=None):
         if not valid_contract(mint) or self.chain not in GMGN_CHAINS:
@@ -691,6 +696,7 @@ class Scanner:
                 raise DataError('GMGN en pausa temporal por cuota.')
             self.cache[('gmgn_last',)] = time.monotonic()
         def fail(message, limited=False):
+            print('GMGN ' + command + ': ' + message, flush=True)
             self.gmgn_neg[key] = time.time()
             if limited:
                 self.gmgn_blocked_until = time.time() + 300
@@ -699,9 +705,11 @@ class Scanner:
             raise DataError(message) from None
 
         try:
-            proc = subprocess.run(args, capture_output=True, text=True, timeout=10, check=False)
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            fail('GMGN no disponible.')
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=25, check=False)
+        except subprocess.TimeoutExpired:
+            fail('GMGN superó el tiempo de espera de 25 segundos.')
+        except (OSError, ValueError):
+            fail('No se pudo ejecutar la consulta de GMGN.')
         if proc.returncode:
             report = (proc.stderr or '') + ' ' + (proc.stdout or '')[:500]
             fail('GMGN no devolvió datos: revisa clave, permisos y cuota gratuita.',
@@ -1377,8 +1385,9 @@ def sources_text(pair, fetched, gmgn_note=''):
     created = number((pair.get('activity_extra') or pair).get('pairCreatedAt'))
     if created and 0 < created / 1000 <= time.time():
         lines.append(f'Creación del par (no del token): {stamp(created / 1000)}')
+    gmgn_note = gmgn_note or pair.get('gmgn_error', '')
     if gmgn_note:
-        lines.append(esc(gmgn_note, 300))
+        lines.append('Estado GMGN: ' + esc(gmgn_note, 300))
     lines += [f'Consulta de mercado: {stamp(fetched)}.',
               'La hora de consulta no garantiza la frescura del proveedor. — significa dato no disponible, nunca cero.']
     return '\n\n'.join(lines)
@@ -1831,12 +1840,7 @@ class Bot:
                 return self.send(chat,report,markup)
             if action == 'sources':
                 pair, _, fetched = self.scanner.market(arg)
-                note = ''
-                try:
-                    self.scanner.gmgn_query('info', arg)
-                except DataError as error:
-                    note = str(error)
-                return self.send(chat, sources_text(pair, fetched, note))
+                return self.send(chat, sources_text(pair, fetched))
             if action == 'ath':
                 return self.send(chat, self.scanner.history(arg))
             if action == 'holders':
