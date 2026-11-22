@@ -1402,10 +1402,10 @@ def card(mint, pair, fetched, info=None):
     sale = pair.get('dev_sell_text')
     if sale and sale != '⚪ Sin verificar':
         distribution.append(metric('Ventas del DEV', sale))
+    lines += section('🟦 <b>DISTRIBUCIÓN Y DEV</b>', distribution, branches=True)
     paid = pair.get('dex_paid')
     if isinstance(paid, bool):
-        distribution.append(metric('🦉 DEX pagado', '🟢 Sí' if paid else '🔴 No'))
-    lines += section('🟦 <b>DISTRIBUCIÓN Y DEV</b>', distribution, branches=True)
+        lines.append(metric('🦉 DEX pagado', '🟢 Sí' if paid else '🔴 No'))
     summary = aser_summary(pair.get('aser_signals'))
     if summary:
         lines.append(summary)
