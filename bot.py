@@ -1304,23 +1304,35 @@ def comparison_snapshot(mint,pair,fetched,info):
 
 
 def comparison_text(old,new):
-    if not old or any(old.get(k)!=new.get(k) for k in ('mint','chain')):
-        return '🔄 <b>DESDE LA CONSULTA ANTERIOR</b>\nComparación disponible en la próxima actualización.'
-    elapsed=max(0,int(new['time']-old['time']))
-    age=f'{elapsed}s' if elapsed<60 else f'{elapsed//60} min' if elapsed<3600 else f'{elapsed//3600}h {(elapsed%3600)//60} min'
-    comparable=old.get('source')==new.get('source') and old.get('pool')==new.get('pool')
-    def percent(key):
-        a,b=number(old.get(key)),number(new.get(key))
-        return f'{(b/a-1)*100:+.2f}%' if comparable and a is not None and a>0 and b is not None and b>=0 else '—'
-    a,b=number(old.get('holders')),number(new.get('holders'))
-    holders=f'{b-a:+.0f}' if comparable and a is not None and b is not None and min(a,b)>=0 else '—'
-    a,b=number(old.get('top10')),number(new.get('top10'))
-    top=f'{a*100:.2f}% → {b*100:.2f}%' if comparable and a is not None and b is not None and 0<=a<=1 and 0<=b<=1 else '—'
-    rows = section(f'🔄 <b>DESDE LA CONSULTA ANTERIOR · {age}</b>', [
-        metric('Precio', percent('price')), metric('Liquidez', percent('liquidity')),
-        metric('Holders', holders), metric('Top 10', top),
-    ])
-    return '\n'.join(rows)
+    if not old or any(old.get(k) != new.get(k) for k in ('mint', 'chain', 'source', 'pool')):
+        return ''
+    elapsed = max(0, int(new['time'] - old['time']))
+    age = f'{elapsed}s' if elapsed < 60 else f'{elapsed // 60} min' if elapsed < 3600 else f'{elapsed // 3600}h {(elapsed % 3600) // 60} min'
+    rows = []
+    comparable = False
+    for key, label in [('price', 'Precio'), ('liquidity', 'Liquidez'), ('holders', 'Holders'), ('top10', 'Top 10')]:
+        before, after = number(old.get(key)), number(new.get(key))
+        if before is None or after is None or min(before, after) < 0:
+            continue
+        if key == 'top10':
+            if max(before, after) > 1:
+                continue
+            previous, current = f'{before * 100:.2f}%', f'{after * 100:.2f}%'
+            value = f'{previous} → {current}' if previous != current else ''
+        elif key == 'holders':
+            value = f'{after - before:+.0f}'
+        elif before > 0:
+            value = f'{(after / before - 1) * 100:+.2f}%'
+        elif after == 0:
+            value = ''
+        else:
+            continue
+        comparable = True
+        if value and value not in ('+0', '-0', '+0.00%', '-0.00%'):
+            rows.append(metric(label, value))
+    if rows:
+        return '\n'.join(section(f'🔄 <b>CAMBIOS · {age}</b>', rows, branches=True))
+    return f'🔄 <b>Sin cambios · {age}</b>' if comparable else ''
 
 
 def audit_summary(chain,sources,market=None):
@@ -1519,7 +1531,7 @@ def icon_markup(payload, ids):
     result = dict(payload)
     headings = (('🟩','TOKEN STATS',0),('🏔','ATH',1),('⚡','ACTIVIDAD DEL PAR',2),
       ('🦉','DEX PAGADO',3),('🟦','DISTRIBUCIÓN',4),('📡','ASER',5),('🌐','SOCIALS',6),
-      ('📝','CONTRATO',7),('🔄','ÚLTIMA CONSULTA',10),('🔄','DESDE LA CONSULTA ANTERIOR',11))
+      ('📝','CONTRATO',7),('🔄','ÚLTIMA CONSULTA',10),('🔄','CAMBIOS',11),('🔄','Sin cambios',11))
     for field in ('text','caption'):
         if field in result:
             for old,title,i in headings:
