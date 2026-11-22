@@ -1405,7 +1405,7 @@ def card(mint, pair, fetched, info=None):
     paid = pair.get('dex_paid')
     if isinstance(paid, bool):
         distribution.append(metric('🦉 DEX pagado', '🟢 Sí' if paid else '🔴 No'))
-    lines += section('🟦 <b>DISTRIBUCIÓN Y DEV</b>', distribution)
+    lines += section('🟦 <b>DISTRIBUCIÓN Y DEV</b>', distribution, branches=True)
     summary = aser_summary(pair.get('aser_signals'))
     if summary:
         lines.append(summary)
