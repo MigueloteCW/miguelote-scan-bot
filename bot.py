@@ -1271,8 +1271,10 @@ def metric(label, value):
     return f'{label}: <b>{value}</b>'
 
 
-def section(title, rows):
+def section(title, rows, *, branches=False):
     visible = [row for row in rows if row]
+    if visible and branches:
+        visible = [f"├ {row}" for row in visible[:-1]] + [f"└ {visible[-1]}"]
     return [title, *visible] if visible else []
 
 
@@ -1290,7 +1292,7 @@ def activity_lines(pair):
         metric('Liquidez / MC', liquidity_ratio),
         metric('Volumen / liquidez 24 h', turnover),
         metric('Boosts DEX', boost_text),
-    ])
+    ], branches=True)
 
 
 def comparison_snapshot(mint,pair,fetched,info):
@@ -1387,7 +1389,7 @@ def card(mint, pair, fetched, info=None):
     else:
         stats.extend([metric('Compras 24 h', buys), metric('Ventas 24 h', sells)])
     stats.append(metric('Holders', compact(info.get('holder_count'))))
-    lines += section('🟩 <b>TOKEN STATS</b>', stats)
+    lines += section('🟩 <b>TOKEN STATS</b>', stats, branches=True)
     lines += activity_lines(pair)
     distribution = [metric('Top 10', ratio(stat.get('top_10_holder_rate')))]
     for key in ('sniper_text', 'bundler_text'):
