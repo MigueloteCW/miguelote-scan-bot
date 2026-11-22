@@ -1362,7 +1362,10 @@ def card(mint, pair, fetched, info=None):
     if age != '—':
         network.append('🌱 ' + age)
     lines = [f'<b>{name} (${symbol})</b>', ' · '.join(network)]
-    stats = [metric('Capitalización', compact(pair.get('marketCap'), True))]
+    stats = [
+        metric('Capitalización', compact(pair.get('marketCap'), True)),
+        metric('Precio actual', fmt(current, money=True)),
+    ]
     if ath is not None and ath > 0 and (current is None or current <= ath):
         circulating = number(info.get('circulating_supply'))
         if circulating is not None and circulating >= 0:
@@ -1371,7 +1374,7 @@ def card(mint, pair, fetched, info=None):
         if current is not None:
             stats.append(metric('Desde el ATH', change((current / ath - 1) * 100)))
     stats.extend([
-        metric('Precio', fmt(current, money=True)), metric('Supply total', supply_text),
+        metric('Supply total', supply_text),
         metric('Liquidez', compact((pair.get('liquidity') or {}).get('usd'), True)),
         metric('Volumen 24 h', compact((pair.get('volume') or {}).get('h24'), True)),
         ' · '.join(filter(None, [metric('5 min', change(changes.get('m5'))),
