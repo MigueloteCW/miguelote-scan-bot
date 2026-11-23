@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import html
+from html.parser import HTMLParser
 import http.client
 import ipaddress
 import json
@@ -631,6 +632,15 @@ class Scanner:
                 result['activity_extra']={k:row.get(k) for k in ('txns','boosts','pairCreatedAt','info')}
         except DataError:
             pass
+        links = project_urls(pair.get('gmgn_info') or {}, result)
+        website = links.get('Web')
+        if website and 'Discord' not in links:
+            key = ('website_discord', self.chain, mint, website)
+            cached = self.cache.get(key)
+            if cached is None or time.time() - cached[0] >= (3600 if cached[1] else 300):
+                cached = (time.time(), website_discord(website))
+                self.cache[key] = cached
+            result['website_discord'] = cached[1]
         return result
 
     def gmgn_market(self, mint):
@@ -1259,7 +1269,38 @@ SOCIAL_DOMAINS = {
 }
 
 
-def project_links(info, pair):
+class DiscordInvites(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.urls = {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag != 'a':
+            return
+        url = dict(attrs).get('href') or ''
+        match = re.fullmatch(r'https://(?:discord[.]gg/|(?:www[.])?discord[.]com/invite/)([A-Za-z0-9_-]+)/?(?:[?#][^ ]*)?', url)
+        if match:
+            self.urls[match[1]] = url
+
+
+def website_discord(website):
+    if not image_url(website):
+        return None
+    try:
+        request = urllib.request.Request(website, headers={'User-Agent': USER_AGENT, 'Accept': 'text/html'})
+        with IMAGE_OPENER.open(request, timeout=2) as response:
+            if response.headers.get_content_type() != 'text/html':
+                return None
+            parser = DiscordInvites()
+            parser.feed(response.read(262144).decode('utf-8', errors='replace'))
+            if len(parser.urls) == 1:
+                return next(iter(parser.urls.values()))
+    except (OSError, ValueError, http.client.HTTPException):
+        pass
+    return None
+
+
+def project_urls(info, pair):
     links = {}
 
     def add(url, website=False):
@@ -1271,7 +1312,7 @@ def project_links(info, pair):
         if not label and website:
             label = 'Web'
         if label and label not in links:
-            links[label] = safe_link(label, url)
+            links[label] = url
 
     social = info.get('link')
     if isinstance(social, dict):
@@ -1290,7 +1331,13 @@ def project_links(info, pair):
                 for row in rows:
                     if isinstance(row, dict):
                         add(row.get('url'), website=key == 'websites')
-    return [links[label] for label in ('Web', *SOCIAL_DOMAINS) if label in links]
+    add(pair.get('website_discord'))
+    return links
+
+
+def project_links(info, pair):
+    links = project_urls(info, pair)
+    return [safe_link(label, links[label]) for label in ('Web', *SOCIAL_DOMAINS) if label in links]
 
 
 def age_text(timestamp, now):
