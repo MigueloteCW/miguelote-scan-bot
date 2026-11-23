@@ -628,7 +628,7 @@ class Scanner:
                      and pair.get('pairAddress') and same_token(p.get('pairAddress'),pair['pairAddress'])]
             if matches:
                 row=matches[0]
-                result['activity_extra']={k:row.get(k) for k in ('txns','boosts','pairCreatedAt')}
+                result['activity_extra']={k:row.get(k) for k in ('txns','boosts','pairCreatedAt','info')}
         except DataError:
             pass
         return result
@@ -1250,6 +1250,49 @@ def safe_link(label, url):
     return f'<a href="{html.escape(url,quote=True)}">{esc(label)}</a>'
 
 
+SOCIAL_DOMAINS = {
+    'TG': ('t.me', 'telegram.me'), 'Discord': ('discord.gg', 'discord.com'),
+    'X': ('x.com', 'twitter.com'), 'Reddit': ('reddit.com', 'redd.it'),
+    'WhatsApp': ('whatsapp.com', 'wa.me'), 'YouTube': ('youtube.com', 'youtu.be'),
+    'Instagram': ('instagram.com',), 'TikTok': ('tiktok.com',),
+    'Facebook': ('facebook.com', 'fb.com'), 'GitHub': ('github.com',),
+}
+
+
+def project_links(info, pair):
+    links = {}
+
+    def add(url, website=False):
+        if not safe_link('link', url):
+            return
+        host = urllib.parse.urlsplit(url).hostname.lower()
+        label = next((name for name, domains in SOCIAL_DOMAINS.items()
+                      if any(host == domain or host.endswith('.' + domain) for domain in domains)), None)
+        if not label and website:
+            label = 'Web'
+        if label and label not in links:
+            links[label] = safe_link(label, url)
+
+    social = info.get('link')
+    if isinstance(social, dict):
+        add(social.get('website'), website=True)
+        for url in social.values():
+            add(url)
+        username = social.get('twitter_username')
+        if isinstance(username, str) and re.fullmatch(r'@?[A-Za-z0-9_]{1,15}', username):
+            add('https://x.com/' + username.lstrip('@'))
+    for metadata in (pair.get('info'), (pair.get('activity_extra') or {}).get('info')):
+        if not isinstance(metadata, dict):
+            continue
+        for key in ('websites', 'socials'):
+            rows = metadata.get(key)
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        add(row.get('url'), website=key == 'websites')
+    return [links[label] for label in ('Web', *SOCIAL_DOMAINS) if label in links]
+
+
 def age_text(timestamp, now):
     value=number(timestamp)
     if value is None or value<=0 or value>now:
@@ -1421,14 +1464,7 @@ def card(mint, pair, fetched, info=None):
     summary = aser_summary(pair.get('aser_signals'))
     if summary:
         lines.append(summary)
-    social=info.get('link') or {}
-    links=[]
-    for label,key in [('Web','website'),('TG','telegram'),('Discord','discord')]:
-        link=safe_link(label,social.get(key))
-        if link:links.append(link)
-    username=social.get('twitter_username')
-    if isinstance(username,str) and re.fullmatch(r'@?[A-Za-z0-9_]{1,15}',username):
-        links.append(safe_link('X','https://x.com/'+username.lstrip('@')))
+    links = project_links(info, pair)
     if links: lines += ['🌐 <b>SOCIALS</b>', ' · '.join(links)]
     lines += [f'📝 <b>CONTRATO</b> <code>{mint}</code>','<i>🔄 <b>ÚLTIMA CONSULTA</b>: <b>'+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</b></i>']
     return '\n'.join(line for line in lines if line)
