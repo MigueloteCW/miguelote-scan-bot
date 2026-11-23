@@ -1751,10 +1751,26 @@ class Bot:
         dt={'ethereum':'ether','bsc':'bnb','base':'base','arbitrum':'arbitrum','avalanche':'avalanche','polygon':'polygon'}
         if pool and chain in dt:
             charts.append({'text':'DEXTools','url':f'https://www.dextools.io/app/en/{dt[chain]}/pair-explorer/{q(pool,safe="")}'})
-        rows=[charts,markup['inline_keyboard'][2]]
-        rows.append([{'text':'👥 Holders','callback_data':'holders:'+data}])
+        map_chains = {'ethereum':'eth', 'bsc':'bsc', 'base':'base', 'arbitrum':'arbitrum',
+                      'avalanche':'avalanche', 'polygon':'polygon', 'hyperevm':'hyperevm',
+                      'arc':'arc', 'robinhood':'robinhood', 'monad':'monad', 'sonic':'sonic',
+                      'aptos':'aptos', 'tron':'tron', 'ton':'ton'}
+        holders = [markup['inline_keyboard'][1][1]]
+        if chain in map_chains:
+            query = urllib.parse.urlencode({'chain':map_chains[chain], 'address':mint})
+            holders.insert(0, {'text':'🫧 Mapa', 'url':'https://v2.bubblemaps.io/map?' + query})
+        rows = [charts, holders, markup['inline_keyboard'][2]]
+        providers = []
         if chain in GMGN_CHAINS:
-            rows[-1].append({'text':'GMGN','url':f'https://gmgn.ai/{GMGN_CHAINS[chain]}/token/{mint}'})
+            providers.append({'text':'GMGN','url':f'https://gmgn.ai/{GMGN_CHAINS[chain]}/token/{mint}'})
+        explorers = {'ethereum':('Etherscan','etherscan.io'), 'base':('BaseScan','basescan.org'),
+                     'bsc':('BscScan','bscscan.com'), 'arbitrum':('Arbiscan','arbiscan.io'),
+                     'polygon':('PolygonScan','polygonscan.com'), 'optimism':('OP Mainnet','optimistic.etherscan.io')}
+        if chain in explorers:
+            name, host = explorers[chain]
+            providers.append({'text':name, 'url':f'https://{host}/token/{q(mint, safe="")}'})
+        if providers:
+            rows.append(providers)
         rows+=markup['inline_keyboard'][4:]
         return {'inline_keyboard':rows}
 
