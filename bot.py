@@ -192,6 +192,9 @@ class Store:
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         with self.lock:
+            self.db.execute("""CREATE TABLE IF NOT EXISTS first_calls (
+                chat INTEGER, chain TEXT, mint TEXT, posted INTEGER, message_id INTEGER,
+                author TEXT NOT NULL, market_cap REAL, PRIMARY KEY(chat, chain, mint))""")
             self.db.execute('CREATE TABLE IF NOT EXISTS preferences (user INTEGER PRIMARY KEY, provider TEXT)')
             self.db.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)')
             if 'updated' not in {row[1] for row in self.db.execute('PRAGMA table_info(state)')}:
@@ -239,6 +242,28 @@ class Store:
             return None
         value = self.get(key)
         return json.loads(value) if value else None
+
+    def claim_call(self, key, origin):
+        with self.lock, self.db:
+            cursor = self.db.execute("""
+                INSERT INTO first_calls(chat,chain,mint,posted,message_id,author)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(chat,chain,mint) DO UPDATE SET
+                posted=excluded.posted, message_id=excluded.message_id, author=excluded.author,
+                market_cap=NULL WHERE (excluded.posted,excluded.message_id)
+                < (first_calls.posted,first_calls.message_id)
+            """, (*key, origin['posted'], origin['id'], origin['author']))
+            return cursor.rowcount == 1
+
+    def set_call_cap(self, key, message_id, cap):
+        with self.lock, self.db:
+            self.db.execute("""UPDATE first_calls SET market_cap=?
+                WHERE chat=? AND chain=? AND mint=? AND message_id=? AND market_cap IS NULL""",
+                (cap, *key, message_id))
+
+    def first_call(self, key):
+        with self.lock:
+            return self.db.execute("""SELECT author,posted,market_cap FROM first_calls
+                WHERE chat=? AND chain=? AND mint=?""", key).fetchone()
 
     def preference(self, user, provider=None):
         if provider is not None:
@@ -1495,6 +1520,32 @@ def bold_metric(text):
     return re.sub(r'(?<![\w>])(?:[0-9]+(?:\.[0-9]+)?%|—)',r'<b>\g<0></b>',text)
 
 
+def call_origin(msg):
+    sender = msg.get('from') or {}
+    channel = msg.get('sender_chat') or {}
+    if sender.get('is_bot') and not channel:
+        return None
+    author = channel.get('title') or ('@' + sender['username'] if sender.get('username')
+              else ' '.join(filter(None, (sender.get('first_name'), sender.get('last_name')))))
+    if author and msg.get('date') and msg.get('message_id'):
+        return {'author': ' '.join(author.split())[:48], 'posted': msg['date'], 'id': msg['message_id']}
+
+
+def call_lines(call):
+    if not call:
+        return []
+    author, posted, cap = call
+    minutes = max(0, int(time.time() - posted) // 60)
+    days, hours = divmod(minutes // 60, 24)
+    elapsed = (f'hace {days} d {hours} h' if days else
+               f'hace {hours} h {minutes % 60} min' if hours else
+               f'hace {minutes} min' if minutes else 'ahora')
+    lines = [f'📣 <b>PRIMERA CALL</b> · {esc(author, 48)} · {elapsed}']
+    if cap is not None:
+        lines.append('└ Capitalización en la call: <b>' + compact(cap, True) + '</b>')
+    return lines
+
+
 def card(mint, pair, fetched, info=None):
     base=pair.get('baseToken') or {}
     info=info or pair.get('gmgn_info') or {}
@@ -1569,6 +1620,7 @@ def card(mint, pair, fetched, info=None):
         lines.append(summary)
     links = project_links(info, pair)
     if links: lines += ['🌐 <b>REDES SOCIALES</b>', ' · '.join(links)]
+    lines += call_lines(pair.get('first_call'))
     lines += [f'📝 <b>CA</b> <code>{mint}</code>','<i>🔄 <b>ÚLTIMA CONSULTA</b>: <b>'+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</b></i>']
     return '\n'.join(line for line in lines if line)
 
@@ -2022,6 +2074,9 @@ class Bot:
                         return self.send(chat,'Envía un solo ticker por consulta, por ejemplo $CHOP.')
                     arg='$'+tickers[0]
                 action = 'scan'
+        group = msg['chat'].get('type') in ('group', 'supergroup')
+        origin = call_origin(msg) if (group and not callback and action == 'scan'
+                                      and (valid_contract(arg) or network_contract(arg))) else None
         if action=='scan' and re.fullmatch(r'\$[A-Za-z][A-Za-z0-9_]{0,19}',arg):
             if time.monotonic()-max(self.last_request.get(user,-100),self.last_request.get(('ticker',user),-100))<3:
                 return self.send(chat,'Espera unos segundos antes de la siguiente consulta.')
@@ -2081,6 +2136,8 @@ class Bot:
                 message='Esta ficha ha caducado. Envía de nuevo el contrato.'
                 return self.callback_notice(callback,message) if callback else self.send(chat,message)
             chain,arg=ref['chain'],ref['mint']
+            if group and callback and not refreshing and action == 'scan':
+                origin = ref.get('call_origin')
         elif ':' in arg:
             chain,arg=arg.split(':',1)
             chain=canonical_chain(chain)
@@ -2104,7 +2161,7 @@ class Bot:
                         choices=chains or list(GMGN_CHAINS.keys())[1:]
                         buttons=[]
                         for c in choices[:30]:
-                            ref=self.scanner.store.reference({'chat':chat,'chain':c,'mint':arg})
+                            ref=self.scanner.store.reference({'chat':chat,'chain':c,'mint':arg, 'call_origin':origin})
                             buttons.append({'text':c.title(),'callback_data':action+':ref_'+ref})
                         return self.send(chat,'Elige la red del contrato:',{'inline_keyboard':[buttons[i:i+2] for i in range(0,len(buttons),2)]})
             if not re.fullmatch(r'[a-z0-9-]{1,40}',chain):
@@ -2116,6 +2173,8 @@ class Bot:
         except DataError as error:
             return self.send(chat,esc(str(error),500))
         self.scanner.chain=chain
+        call_key = (chat, chain, arg)
+        claimed = origin is not None and self.scanner.store.claim_call(call_key, origin)
         if time.monotonic() - self.last_request.get(user, -100) < 3:
             message = 'Espera unos segundos antes de la siguiente consulta.'
             return self.callback_notice(callback, message) if callback else self.send(chat, message)
@@ -2124,12 +2183,18 @@ class Bot:
             self.callback_notice(callback)  # quita el indicador de carga del botón
         try:
             if action == 'scan':
-                pair, _, fetched = (self.scanner.refresh_market(arg) if refreshing else self.scanner.market(arg))
+                pair, _, fetched = (self.scanner.refresh_market(arg) if refreshing or claimed else self.scanner.market(arg))
+                if claimed:
+                    cap = number(pair.get('marketCap'))
+                    if cap is not None and cap > 0 and abs(fetched - origin['posted']) <= 60:
+                        self.scanner.store.set_call_cap(call_key, origin['id'], cap)
                 pair, logos = self.scanner.card_inputs(arg, pair, refreshing)
                 info = pair.get('gmgn_info') or {}
                 current=comparison_snapshot(arg,pair,fetched,info)
                 self._delivery_snapshot = {'chat': chat, 'value': current,
                                            'message_id': msg.get('message_id') if refreshing else None}
+                if group:
+                    pair = dict(pair, first_call=self.scanner.store.first_call(call_key))
                 text=card(arg,pair,fetched,info)
                 markup=self.network_keyboard(chat,arg,pair,user)
                 if refreshing:
