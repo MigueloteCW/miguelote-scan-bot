@@ -812,6 +812,7 @@ class Scanner:
         jobs = {
             'activity': (lambda: self.enrich_activity(mint, pair), dict(pair)),
             'dex_paid': (lambda: self.dex_paid(chain,mint), None),
+            'largest_holder': (lambda: largest_holder(self.gmgn_query('holders', mint)), None),
             'sniper_text': (lambda: self.current_snipers(mint), '🎯 Snipers —'),
             'bundler_text': (lambda: self.current_tag_holdings(mint, 'bundler'), 'Bundled —'),
             'dev_sell_text': (lambda: self.dev_sell(mint, info), '⚪ Sin verificar'),
@@ -830,7 +831,7 @@ class Scanner:
                     print('Consulta opcional fallida: ' + name + ' (' + type(error).__name__ + ')', flush=True)
                     results[name] = jobs[name][1]
         result = dict(results['activity'])
-        result.update({key: results[key] for key in ('sniper_text', 'bundler_text', 'dev_sell_text')})
+        result.update({key: results[key] for key in ('sniper_text', 'bundler_text', 'dev_sell_text', 'largest_holder')})
         result['dex_paid'] = results['dex_paid']
         if results.get('aser_signals') is not None:
             result['aser_signals'] = results['aser_signals']
@@ -1002,6 +1003,54 @@ def security_assessment(chain,sources,market=None):
             'coverage':'parcial' if evidence<5 or len(sources)<2 else 'múltiples fuentes'}
 
 
+def largest_holder(data):
+    rows = data.get('list')
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return None
+    # The holders query explicitly orders by supply share, descending.
+    top = rows[0]
+    share = number(top.get('amount_percentage'))
+    if valid_contract(top.get('address')) and share is not None and 0 <= share <= 1:
+        return share
+
+
+def lp_burn_share(chain, sources, market):
+    if not market or not valid_contract(market.get('pairAddress')):
+        return None
+    pair = market['pairAddress']
+    if chain == 'solana':
+        info = market.get('gmgn_info') or {}
+        security = info.get('security') or {}
+        if not isinstance(security, dict) or info.get('biggest_pool_address') != pair:
+            return None
+        share = number(security.get('burn_ratio'))
+        status = security.get('burn_status')
+        if share is not None and ((status == 'burn' and 0 < share <= 1) or (status == 'none' and share == 0)):
+            return share
+        return None
+    gp = sources.get('GoPlus') or {}
+    pools = gp.get('dex')
+    if not isinstance(pools, list) or len(pools) != 1 or not isinstance(pools[0], dict):
+        return None
+    if pools[0].get('liquidity_type') != 'UniV2' or not same_token(pools[0].get('pair'), pair):
+        return None
+    rows = gp.get('lp_holders')
+    if not isinstance(rows, list) or not rows or number(gp.get('lp_holder_count')) != len(rows):
+        return None
+    shares = {}
+    for row in rows:
+        if not isinstance(row, dict) or not valid_contract(row.get('address')):
+            return None
+        addr = row['address'].lower()
+        ratio = number(row.get('percent'))
+        if addr in shares or ratio is None or not 0 <= ratio <= 1:
+            return None
+        shares[addr] = ratio
+    if not math.isclose(sum(shares.values()), 1.0, abs_tol=1e-8):
+        return None
+    return min(1.0, shares.get('0x' + '0' * 40, 0) + shares.get('0x' + '0' * 36 + 'dead', 0))
+
+
 def security_text(mint,chain,sources,market=None):
     result=security_assessment(chain,sources,market)
     tax=tax_details(chain,sources)
@@ -1023,6 +1072,9 @@ def security_text(mint,chain,sources,market=None):
         lines.append('TAX compra: <b>'+percentage(tax['buy'])+'</b>')
         lines.append('TAX venta: <b>'+percentage(tax['sell'])+'</b>')
         if tax.get('mismatch'):lines.append('⚠️ Los proveedores discrepan sobre el TAX.')
+    burned = lp_burn_share(chain, sources, market)
+    if burned is not None:
+        lines.append('🔥 LP quemado: <b>' + fmt(burned, ratio=True) + '</b>')
     lines += ['', '🚩 <b>Alertas</b>']
     lines += ['• '+esc(v,100) for v in result['flags'][:8]] if result['flags'] else ['Sin alertas reportadas en los datos consultados.']
     providers='GoPlus · RugCheck' if chain=='solana' else ('GoPlus · Honeypot.is' if chain in ('ethereum','bsc','base') else 'GoPlus (si hay cobertura)')
@@ -1491,20 +1543,24 @@ def card(mint, pair, fetched, info=None):
     else:
         stats.extend([metric('Compras 24 h', buys), metric('Ventas 24 h', sells)])
     stats.append(metric('Holders', compact(info.get('holder_count'))))
-    lines += section('🟩 <b>TOKEN STATS</b>', stats, branches=True)
+    lines += section('📊 <b>TOKEN STATS</b>', stats, branches=True)
     lines += activity_lines(pair)
-    distribution = [metric('Top 10', ratio(stat.get('top_10_holder_rate')))]
+    distribution = [metric('Top 10', ratio(stat.get('top_10_holder_rate'))),
+                    metric('Mayor holder', ratio(pair.get('largest_holder')))]
     for key in ('sniper_text', 'bundler_text'):
         value = pair.get(key)
         if value and '%' in value:
-            distribution.append(bold_metric(value.removeprefix('🎯 ')))
+            label = value.removeprefix('🎯 ')
+            if key == 'sniper_text':
+                label = label.replace('Snipers', '🎯 Snipers actuales', 1)
+            distribution.append(bold_metric(label))
     distribution.extend([metric('Equipo', ratio(stat.get('dev_team_hold_rate'))),
                          metric('Par', short(pair.get('pairAddress'))),
                          metric('DEV', short(dev.get('creator_address')))])
     sale = pair.get('dev_sell_text')
     if sale and sale != '⚪ Sin verificar':
         distribution.append(metric('Ventas del DEV', sale))
-    lines += section('🟦 <b>DISTRIBUCIÓN Y DEV</b>', distribution, branches=True)
+    lines += section('👥 <b>DISTRIBUCIÓN Y DEV</b>', distribution, branches=True)
     paid = pair.get('dex_paid')
     if isinstance(paid, bool):
         lines.append(metric('🦉 DEX pagado', '🟢 Sí' if paid else '🔴 No'))
@@ -1512,8 +1568,8 @@ def card(mint, pair, fetched, info=None):
     if summary:
         lines.append(summary)
     links = project_links(info, pair)
-    if links: lines += ['🌐 <b>SOCIALS</b>', ' · '.join(links)]
-    lines += [f'📝 <b>CONTRATO</b> <code>{mint}</code>','<i>🔄 <b>ÚLTIMA CONSULTA</b>: <b>'+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</b></i>']
+    if links: lines += ['🌐 <b>REDES SOCIALES</b>', ' · '.join(links)]
+    lines += [f'📝 <b>CA</b> <code>{mint}</code>','<i>🔄 <b>ÚLTIMA CONSULTA</b>: <b>'+datetime.fromtimestamp(fetched,timezone.utc).strftime('%d/%m/%Y %H:%M:%S UTC')+'</b></i>']
     return '\n'.join(line for line in lines if line)
 
 
@@ -1612,9 +1668,9 @@ def icon_markup(payload, ids):
     if not ids:
         return payload
     result = dict(payload)
-    headings = (('🟩','TOKEN STATS',0),('🏔','ATH',1),('⚡','ACTIVIDAD DEL PAR',2),
-      ('🦉','DEX PAGADO',3),('🟦','DISTRIBUCIÓN',4),('📡','ASER',5),('🌐','SOCIALS',6),
-      ('📝','CONTRATO',7),('🔄','ÚLTIMA CONSULTA',10),('🔄','CAMBIOS',11),('🔄','Sin cambios',11))
+    headings = (('📊','TOKEN STATS',0),('🏔','ATH',1),('⚡','ACTIVIDAD DEL PAR',2),
+      ('🦉','DEX PAGADO',3),('👥','DISTRIBUCIÓN',4),('📡','ASER',5),('🌐','REDES SOCIALES',6),
+      ('📝','CA',7),('🔄','ÚLTIMA CONSULTA',10),('🔄','CAMBIOS',11),('🔄','Sin cambios',11))
     for field in ('text','caption'):
         if field in result:
             for old,title,i in headings:
