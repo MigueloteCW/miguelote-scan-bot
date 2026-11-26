@@ -140,8 +140,11 @@ def fetch(url, payload=None, timeout=20, extra_headers=None):
     headers.update(extra_headers or {})
     data = None
     if payload is not None:
-        headers['Content-Type'] = 'application/json'
-        data = json.dumps(payload).encode()
+        if isinstance(payload, bytes):
+            data = payload
+        else:
+            headers['Content-Type'] = 'application/json'
+            data = json.dumps(payload).encode()
     try:
         with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers), timeout=timeout) as response:
             return json.load(response)
@@ -618,6 +621,7 @@ class Scanner:
                 except (ValueError, OSError, http.client.HTTPException):
                     pass
         urls = list(dict.fromkeys(url for url in map(token_image_url, urls) if url))
+        urls.append('https://dd.dexscreener.com/ds-data/tokens/solana/' + mint + '.png?size=lg')
         self.cache[key] = (time.time(), urls)
         return urls
 
@@ -1368,6 +1372,32 @@ IMAGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}),
 
 
 
+def photo_form(payload):
+    url = payload['photo']
+    if not public_https(url):
+        raise DataError('Origen de foto no disponible.')
+    try:
+        request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT, 'Accept': 'image/*'})
+        with IMAGE_OPENER.open(request, timeout=4) as response:
+            image = response.read(10_000_001)
+    except (OSError, ValueError, http.client.HTTPException):
+        raise DataError('No se pudo descargar la foto.') from None
+    if len(image) > 10_000_000 or not image_dimensions(image):
+        raise DataError('Formato o tamaño de foto no admitido.')
+    kind = ('png' if image.startswith(b'\x89PNG') else 'jpeg' if image.startswith(b'\xff\xd8')
+            else 'gif' if image.startswith(b'GIF') else 'webp')
+    boundary = os.urandom(20).hex()
+    fields = []
+    for key, value in payload.items():
+        if key in ('photo', '_upload_photo'):
+            continue
+        value = value if isinstance(value, str) else json.dumps(value)
+        fields.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+    fields.extend([f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="token.{kind}"\r\nContent-Type: image/{kind}\r\n\r\n'.encode(),
+                   image, f'\r\n--{boundary}--\r\n'.encode()])
+    return b''.join(fields), {'Content-Type': 'multipart/form-data; boundary=' + boundary}
+
+
 def probe_image_size(url):
     # Las URLs de imagen las controla el creador del token: nunca se consultan hosts internos.
     if not public_https(url):
@@ -1875,8 +1905,10 @@ class Bot:
 
     def _telegram(self, method, payload):
         try:
-            response = fetch(f'https://api.telegram.org/bot{self.token}/{method}', payload,
-                             timeout=40 if method == 'getUpdates' else 12)
+            body, headers = (photo_form(payload) if method == 'sendPhoto' and payload.get('_upload_photo')
+                             else (payload, {}))
+            response = fetch(f'https://api.telegram.org/bot{self.token}/{method}', body,
+                             timeout=40 if method == 'getUpdates' else 12, extra_headers=headers)
         except RateLimitError as error:
             if method in ('sendMessage', 'sendPhoto', 'editMessageText', 'editMessageCaption'):
                 raise DeliveryRetryError(method, payload, error.retry_after) from None
@@ -1919,7 +1951,12 @@ class Bot:
                 if markup:
                     payload['reply_markup'] = markup
             try:
-                result = self.api('sendPhoto', payload)
+                try:
+                    result = self.api('sendPhoto', payload)
+                except TelegramRequestError as error:
+                    if error.status != 400:
+                        raise
+                    result = self.api('sendPhoto', dict(payload, _upload_photo=True))
             except DeliveryRetryError as error:
                 if not fits:
                     message = {'chat_id': chat, 'text': text, 'parse_mode': 'HTML',
@@ -1944,6 +1981,8 @@ class Bot:
             return self.send_card(chat,text,markup,fallback(), last_resort=last_resort, attempted=attempted)
         if not sent_photo and last_resort:
             return self.send_card(chat,text,markup,last_resort(), attempted=attempted)
+        if not sent_photo:
+            print(f'Foto ausente: {len(attempted)} URL candidatas agotadas.', flush=True)
         return self.send(chat, text, markup)
 
     def edit_card(self,msg,text,markup):
