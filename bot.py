@@ -1372,7 +1372,51 @@ IMAGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}),
 
 
 
-def project_header(image, name, symbol):
+def network_mark(chain):
+    from io import BytesIO
+    from PIL import Image, ImageDraw, ImageOps
+    mark = Image.new('RGBA', (64, 64))
+    pen = ImageDraw.Draw(mark)
+    if chain == 'solana':
+        for y, reverse in ((9, False), (26, True), (43, False)):
+            coords = [(14, y), (58, y), (48, y+11), (4, y+11)]
+            if reverse:
+                coords = [(62-x, h) for x, h in coords]
+            pen.polygon(coords, fill=('#42e8af' if y==9 else '#6999dc' if reverse else '#a56afa'))
+        return mark
+    if chain == 'bsc':
+        gold = '#f3ba2f'
+        for x, y in ((32,5),(59,32),(32,59),(5,32),(32,32)):
+            if (x,y) in ((32,5),(32,59)):
+                tip = 1 if y==5 else -1
+                pen.polygon([(32,y-4*tip),(51,y+15*tip),(44,y+22*tip),(32,y+10*tip),
+                             (20,y+22*tip),(13,y+15*tip)], fill=gold)
+            else:
+                pen.polygon([(x-6,y),(x,y-6),(x+6,y),(x,y+6)], fill=gold)
+        return mark
+    if not re.fullmatch(r'[a-z0-9-]{1,40}', chain):
+        return None
+    cached = NETWORK_MARKS.get(chain)
+    if cached and time.monotonic() < cached[0]:
+        return cached[1]
+    try:
+        url = 'https://dd.dexscreener.com/ds-data/chains/' + chain + '.png'
+        with IMAGE_OPENER.open(url, timeout=2) as response:
+            raw = response.read(262145)
+        with Image.open(BytesIO(raw)) as source:
+            if len(raw)>262144 or max(source.size)>1024:
+                raise ValueError('Logo demasiado grande')
+            mark = ImageOps.contain(source.convert('RGBA'), (64,64), Image.Resampling.LANCZOS)
+    except (OSError, ValueError, http.client.HTTPException, Image.DecompressionBombError):
+        mark = None
+    NETWORK_MARKS[chain] = (time.monotonic() + (86400 if mark else 300), mark)
+    return mark
+
+
+NETWORK_MARKS = {}
+
+
+def project_header(image, name, symbol, chain=None):
     from io import BytesIO
     from PIL import Image, ImageDraw, ImageFont, ImageOps
     try:
@@ -1417,12 +1461,30 @@ def project_header(image, name, symbol):
     ticker, ticker_font = text_lines('$' + symbol.lstrip('$')[:80], 66, 2)
     rows = [(t, title_font, '#ffffff') for t in title] + [(t, ticker_font, '#59e3bd') for t in ticker]
     height = sum(font.size + 12 for _, font, _ in rows) + 16
+    if chain:
+        chain = canonical_chain(chain)
+        network = 'Red: ' + chain.upper()
+        mark = network_mark(chain)
+        font_size = 47
+        while True:
+            network_font = ImageFont.truetype('DejaVuSans-Bold.ttf', font_size)
+            width = draw.textlength(network, font=network_font) + (68 if mark else 0)
+            if width <= 630 or font_size <= 16:
+                break
+            font_size -= 2
+        height += 84
     y = (720 - height) // 2
     for index, (line, font, color) in enumerate(rows):
         if index == len(title):
             y += 16
         draw.text((1080, y), line, font=font, fill=color, anchor='mt')
         y += font.size + 12
+    if chain:
+        x = round(1080 - width / 2)
+        draw.text((x, y + 41), network, font=network_font, fill='#edf3fa', anchor='lm')
+        if mark:
+            mark.thumbnail((54,54), Image.Resampling.LANCZOS)
+            canvas.paste(mark, (round(1080 + width / 2 - 54), y + 41 - mark.height//2), mark)
     out = BytesIO()
     canvas.save(out, 'JPEG', quality=92)
     return out.getvalue()
@@ -2403,7 +2465,7 @@ class Bot:
                         self.scanner.store.card_snapshot(chat,msg['message_id'],current)
                     return result
                 base = pair.get('baseToken') or {}
-                project = (str(base.get('name') or 'Token'), str(base.get('symbol') or '?'))
+                project = (str(base.get('name') or 'Token'), str(base.get('symbol') or '?'), pair.get('chainId') or chain)
                 result=self.send_card(chat,text,markup,logos,project=project,
                                       fallback=lambda:self.scanner.extra_images(arg),
                                       last_resort=lambda:self.scanner.solana_logos(arg))
