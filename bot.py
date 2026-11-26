@@ -572,6 +572,20 @@ class Scanner:
         self.cache[key]=(time.time(),result)
         return result
 
+    def solana_report(self, mint):
+        key = ('solana_report', mint)
+        hit = self.cache.get(key)
+        if hit and time.time() - hit[0] < (60 if hit[1] else 30):
+            return hit[1]
+        try:
+            report = self.transport('https://api.rugcheck.xyz/v1/tokens/' + mint + '/report', timeout=4)
+        except DataError:
+            report = None
+        if not isinstance(report, dict) or report.get('mint') != mint:
+            report = {}
+        self.cache[key] = (time.time(), report)
+        return report
+
     def solana_logos(self, mint):
         if self.chain != 'solana' or not valid_address(mint):
             return []
@@ -587,14 +601,22 @@ class Scanner:
                     urls.append(token.get('logoURI'))
         except (DataError, AttributeError, TypeError):
             pass
-        try:
-            report = self.transport('https://api.rugcheck.xyz/v1/tokens/' + mint + '/report', timeout=3)
-            if isinstance(report, dict) and report.get('mint') == mint:
-                metadata = report.get('fileMeta')
-                if isinstance(metadata, dict):
-                    urls.append(metadata.get('image'))
-        except DataError:
-            pass
+        report = self.solana_report(mint)
+        metadata = report.get('fileMeta') or {}
+        if isinstance(metadata, dict):
+            urls.append(metadata.get('image'))
+        token_meta = report.get('tokenMeta') or {}
+        if isinstance(token_meta, dict) and not any(token_image_url(url) for url in urls):
+            metadata_url = token_image_url(token_meta.get('uri'))
+            if metadata_url:
+                try:
+                    request = urllib.request.Request(metadata_url, headers={'User-Agent': USER_AGENT})
+                    with IMAGE_OPENER.open(request, timeout=3) as response:
+                        metadata = json.loads(response.read(262145))
+                        if isinstance(metadata, dict):
+                            urls.append(metadata.get('image'))
+                except (ValueError, OSError, http.client.HTTPException):
+                    pass
         urls = list(dict.fromkeys(url for url in map(token_image_url, urls) if url))
         self.cache[key] = (time.time(), urls)
         return urls
@@ -870,6 +892,9 @@ class Scanner:
             'dev_sell_text': (lambda: self.dev_sell(mint, info), '⚪ Sin verificar'),
         }
         if chain == 'solana':
+            if (pair.get('source') != 'GMGN' or number(info.get('total_supply')) is None
+                    or number(info.get('holder_count')) is None):
+                jobs['token_report'] = (lambda: self.solana_report(mint), {})
             jobs['aser_signals'] = (lambda: self.aser_signals(mint), None)
         if not refreshing:
             jobs['images'] = (lambda: self.rank_images(self.images(mint, info))[0], [])
@@ -889,7 +914,29 @@ class Scanner:
             result['aser_signals'] = results['aser_signals']
         else:
             result.pop('aser_signals', None)
-        return result, results.get('images', [])
+        logos = results.get('images', [])
+        report = results.get('token_report') or {}
+        if report:
+            enriched = dict(info)
+            token = report.get('token') or {}
+            supply = number(token.get('supply')) if isinstance(token, dict) else None
+            decimals = token.get('decimals') if isinstance(token, dict) else None
+            if supply is not None and supply >= 0 and type(decimals) is int and 0 <= decimals <= 255:
+                if number(enriched.get('total_supply')) is None:
+                    enriched['total_supply'] = supply / 10 ** decimals
+            holders = report.get('totalHolders')
+            if type(holders) is int and holders > 0 and number(enriched.get('holder_count')) is None:
+                enriched['holder_count'] = holders
+            dev = dict(enriched.get('dev') or {})
+            if not dev.get('creator_address') and valid_address(report.get('creator')):
+                dev['creator_address'] = report['creator']
+                enriched['dev'] = dev
+            result['gmgn_info'] = enriched
+            metadata = report.get('fileMeta') or {}
+            url = token_image_url(metadata.get('image')) if isinstance(metadata, dict) else None
+            if url and url not in logos:
+                logos = [*logos, url]
+        return result, logos
 
     def history(self, mint):
         pair, _, fetched = self.market(mint)
