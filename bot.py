@@ -513,7 +513,7 @@ class Scanner:
                 urls.extend([meta.get('header'),meta.get('imageUrl')])
         except DataError:
             pass
-        return list(dict.fromkeys(u for u in urls if image_url(u)))[:6]
+        return list(dict.fromkeys(u for u in map(token_image_url, urls) if u))[:6]
 
     def rank_images(self,urls):
         urls=list(dict.fromkeys(u for u in urls if image_url(u)))[:10]
@@ -571,6 +571,33 @@ class Scanner:
         result=list(dict.fromkeys(u for u in urls if image_url(u)))[:4]
         self.cache[key]=(time.time(),result)
         return result
+
+    def solana_logos(self, mint):
+        if self.chain != 'solana' or not valid_address(mint):
+            return []
+        key = ('solana_logo', mint)
+        hit = self.cache.get(key)
+        if hit and time.time() - hit[0] < (3600 if hit[1] else 60):
+            return hit[1]
+        urls = []
+        try:
+            result = self.transport('https://api-v3.raydium.io/mint/ids?mints=' + mint, timeout=3)
+            for token in (result or {}).get('data') or []:
+                if isinstance(token, dict) and token.get('address') == mint:
+                    urls.append(token.get('logoURI'))
+        except (DataError, AttributeError, TypeError):
+            pass
+        try:
+            report = self.transport('https://api.rugcheck.xyz/v1/tokens/' + mint + '/report', timeout=3)
+            if isinstance(report, dict) and report.get('mint') == mint:
+                metadata = report.get('fileMeta')
+                if isinstance(metadata, dict):
+                    urls.append(metadata.get('image'))
+        except DataError:
+            pass
+        urls = list(dict.fromkeys(url for url in map(token_image_url, urls) if url))
+        self.cache[key] = (time.time(), urls)
+        return urls
 
     def refresh_market(self,mint):
         for key in list(self.cache):
@@ -1317,6 +1344,14 @@ def image_quality(size):
     return level,w*h
 
 
+def token_image_url(value):
+    if isinstance(value, str) and value.startswith('ipfs://'):
+        path = value[7:].removeprefix('ipfs/')
+        if re.fullmatch(r'[a-zA-Z0-9]+(?:/[^?#]*)?', path):
+            value = 'https://ipfs.io/ipfs/' + path
+    return value if image_url(value) else None
+
+
 def image_url(value):
     if not isinstance(value,str) or len(value)>2048:return False
     try:
@@ -1815,7 +1850,8 @@ class Bot:
             payload['reply_markup'] = markup
         return self.api('sendMessage', payload)
 
-    def send_card(self, chat, text, markup, logo, fallback=None):
+    def send_card(self, chat, text, markup, logo, fallback=None, last_resort=None, attempted=None):
+        attempted = set() if attempted is None else attempted
         logos = logo if isinstance(logo, list) else [logo]
         if self.scanner and hasattr(self.scanner,'rank_images'):
             logos,sharp=self.scanner.rank_images(logos)
@@ -1827,6 +1863,9 @@ class Bot:
         for logo in logos:
             if not isinstance(logo,str) or not logo.startswith('https://') or len(logo)>=2048:
                 continue
+            if logo in attempted:
+                continue
+            attempted.add(logo)
             payload = {'chat_id': chat, 'photo': logo}
             if fits:
                 payload.update(caption=text, parse_mode='HTML')
@@ -1855,7 +1894,9 @@ class Bot:
             sent_photo = True
             break
         if not sent_photo and fallback and not limited:
-            return self.send_card(chat,text,markup,fallback())
+            return self.send_card(chat,text,markup,fallback(), last_resort=last_resort, attempted=attempted)
+        if not sent_photo and last_resort:
+            return self.send_card(chat,text,markup,last_resort(), attempted=attempted)
         return self.send(chat, text, markup)
 
     def edit_card(self,msg,text,markup):
@@ -2207,7 +2248,8 @@ class Bot:
                         self.scanner.store.card_snapshot(chat,msg['message_id'],current)
                     return result
                 result=self.send_card(chat,text,markup,logos,
-                                      fallback=lambda:self.scanner.extra_images(arg))
+                                      fallback=lambda:self.scanner.extra_images(arg),
+                                      last_resort=lambda:self.scanner.solana_logos(arg))
                 if isinstance(result,dict) and result.get('message_id'):
                     self.scanner.store.card_snapshot(chat,result['message_id'],current)
                 return result
