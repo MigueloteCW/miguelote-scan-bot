@@ -426,16 +426,31 @@ class Scanner:
             return self.cache[key][1]
         if time.time()<self.cache.get(('dex_pause',),0):
             raise DataError('DexScreener en pausa temporal por límite de consultas.')
-        try:
-            data=self.transport('https://api.dexscreener.com/latest/dex/search?q='+urllib.parse.quote(mint,safe=''), timeout=6)
-        except RateLimitError as error:
-            self.cache[('dex_pause',)]=time.time()+error.retry_after
-            raise
-        rows=data.get('pairs') if isinstance(data,dict) else None
-        if not isinstance(rows,list):
-            raise DataError('Mercado no disponible. Inténtalo más tarde.')
-        rows=[p for p in rows if isinstance(p,dict) and same_token((p.get('baseToken') or {}).get('address'),mint)
-              and isinstance(p.get('chainId'),str) and re.fullmatch(r'[a-z0-9-]{1,40}',p['chainId'])]
+        address = urllib.parse.quote(mint, safe='')
+        urls = ['https://api.dexscreener.com/latest/dex/search?q=' + address]
+        direct = 'https://api.dexscreener.com/token-pairs/v1/solana/' + address
+        if valid_address(mint) and self.chain == 'solana':
+            urls.insert(0, direct)
+        for url in urls:
+            try:
+                data = self.transport(url, timeout=6)
+                candidates = data if isinstance(data, list) else (data or {}).get('pairs') if isinstance(data, dict) else None
+                if not isinstance(candidates, list):
+                    raise DataError('Respuesta de mercado no válida.')
+                rows = [p for p in candidates if isinstance(p, dict)
+                        and isinstance(p.get('baseToken'), dict)
+                        and same_token(p['baseToken'].get('address'), mint)
+                        and isinstance(p.get('chainId'), str)
+                        and re.fullmatch(r'[a-z0-9-]{1,40}', p['chainId'])
+                        and (url != direct or p['chainId'] == 'solana')]
+                if rows:
+                    break
+            except RateLimitError as error:
+                self.cache[('dex_pause',)] = time.time() + error.retry_after
+                raise
+            except DataError:
+                if url == urls[-1]:
+                    raise
         self.cache[key]=(time.time(),rows)
         return rows
 
@@ -690,12 +705,15 @@ class Scanner:
                 pair=dict(max(rows,key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0))
                 pair.update(gmgn_info={},source='DexScreener',gmgn_error=gmgn_error)
                 return pair,rows,self.cache[('dex',normalized(mint))][0]
-        except DataError:pass
+            dex_error = 'Sin pares coincidentes'
+        except DataError as error:
+            dex_error = str(error)
         try:
             pair, rows, fetched = self.gecko_market(mint)
             pair = dict(pair, gmgn_error=gmgn_error)
             return pair, rows, fetched
-        except DataError:
+        except DataError as error:
+            print(f'Mercado {self.chain} {mint}: GMGN=sin mercado confirmado | DexScreener={dex_error[:160]} | GeckoTerminal={str(error)[:160]}', flush=True)
             raise DataError('No se pudo obtener el mercado de este contrato en '+self.chain+'. Los proveedores no responden o no tienen cobertura. Reinténtalo más tarde.') from None
 
     def enrich_activity(self,mint,pair):
