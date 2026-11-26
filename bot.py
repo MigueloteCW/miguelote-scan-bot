@@ -504,7 +504,7 @@ class Scanner:
         urls=[]
         try:
             metadata=self.aser(mint)
-            urls += [metadata.get('header'),metadata.get('image')]
+            urls.append(metadata.get('image'))
         except DataError:
             pass
         urls.append(info.get('logo'))
@@ -513,7 +513,7 @@ class Scanner:
             rows.sort(key=lambda p:number((p.get('liquidity') or {}).get('usd')) or 0,reverse=True)
             for row in rows:
                 meta=row.get('info') or {}
-                urls.extend([meta.get('header'),meta.get('imageUrl')])
+                urls.append(meta.get('imageUrl'))
         except DataError:
             pass
         return list(dict.fromkeys(u for u in map(token_image_url, urls) if u))[:6]
@@ -550,7 +550,7 @@ class Scanner:
                 attr=token.get('attributes') if isinstance(token,dict) else None
                 if isinstance(attr,dict) and same_token(attr.get('address'),mint) and isinstance(token.get('id'),str) and token['id'].startswith(network+'_') and same_token(token['id'][len(network)+1:],mint):
                     sizes=attr.get('image') if isinstance(attr.get('image'),dict) else {}
-                    urls.extend([attr.get('banner_image_url'),sizes.get('large'),attr.get('image_url')])
+                    urls.extend([sizes.get('large'),attr.get('image_url')])
             except RateLimitError as error:
                 self.cache[('image_gt_pause',)]=time.time()+error.retry_after
             except DataError:pass
@@ -570,7 +570,7 @@ class Scanner:
                     self.cache[('image_dex_profiles',)]=profiles
             for row in (profiles[1] if profiles else []):
                 if isinstance(row,dict) and row.get('chainId')==self.chain and same_token(row.get('tokenAddress'),mint):
-                    urls.extend([row.get('header'),row.get('icon')])
+                    urls.append(row.get('icon'))
         result=list(dict.fromkeys(u for u in urls if image_url(u)))[:4]
         self.cache[key]=(time.time(),result)
         return result
@@ -1372,6 +1372,62 @@ IMAGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}),
 
 
 
+def project_header(image, name, symbol):
+    from io import BytesIO
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+    try:
+        source = Image.open(BytesIO(image))
+    except Image.DecompressionBombError as error:
+        raise ValueError('Icono demasiado grande') from error
+    with source:
+        if source.width * source.height > 24_000_000:
+            raise ValueError('Icono demasiado grande')
+        icon = ImageOps.exif_transpose(source).convert('RGBA')
+    canvas = Image.new('RGB', (1440, 720), '#101822')
+    icon = ImageOps.contain(icon, (640, 640), Image.Resampling.LANCZOS)
+    canvas.paste(icon, ((720 - icon.width) // 2, (720 - icon.height) // 2), icon)
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((720, 0, 1439, 719), fill='#182535')
+
+    def text_lines(value, max_size, max_lines):
+        for size in range(max_size, 19, -2):
+            font = ImageFont.truetype('DejaVuSans-Bold.ttf', size)
+            lines = ['']
+            for word in value.split():
+                merged = (lines[-1] + ' ' + word).strip()
+                if draw.textlength(merged, font=font) <= 622:
+                    lines[-1] = merged
+                    continue
+                if lines[-1]:
+                    lines.append('')
+                for char in word:
+                    if draw.textlength(lines[-1] + char, font=font) > 622:
+                        lines.append('')
+                    lines[-1] += char
+            if len(lines) <= max_lines:
+                break
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            while lines[-1] and draw.textlength(lines[-1] + '…', font=font) > 622:
+                lines[-1] = lines[-1][:-1]
+            lines[-1] += '…'
+        return lines, font
+
+    title, title_font = text_lines(name[:160], 82, 3)
+    ticker, ticker_font = text_lines('$' + symbol.lstrip('$')[:80], 66, 2)
+    rows = [(t, title_font, '#ffffff') for t in title] + [(t, ticker_font, '#59e3bd') for t in ticker]
+    height = sum(font.size + 12 for _, font, _ in rows) + 16
+    y = (720 - height) // 2
+    for index, (line, font, color) in enumerate(rows):
+        if index == len(title):
+            y += 16
+        draw.text((1080, y), line, font=font, fill=color, anchor='mt')
+        y += font.size + 12
+    out = BytesIO()
+    canvas.save(out, 'JPEG', quality=92)
+    return out.getvalue()
+
+
 def photo_form(payload):
     url = payload['photo']
     if not public_https(url):
@@ -1384,12 +1440,17 @@ def photo_form(payload):
         raise DataError('No se pudo descargar la foto.') from None
     if len(image) > 10_000_000 or not image_dimensions(image):
         raise DataError('Formato o tamaño de foto no admitido.')
+    if payload.get('_project'):
+        try:
+            image = project_header(image, *payload['_project'])
+        except (ImportError, OSError, ValueError, RuntimeError) as error:
+            print('Cabecera del proyecto: ' + type(error).__name__, flush=True)
     kind = ('png' if image.startswith(b'\x89PNG') else 'jpeg' if image.startswith(b'\xff\xd8')
             else 'gif' if image.startswith(b'GIF') else 'webp')
     boundary = os.urandom(20).hex()
     fields = []
     for key, value in payload.items():
-        if key in ('photo', '_upload_photo'):
+        if key in ('photo', '_upload_photo', '_project'):
             continue
         value = value if isinstance(value, str) else json.dumps(value)
         fields.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
@@ -1929,12 +1990,12 @@ class Bot:
             payload['reply_markup'] = markup
         return self.api('sendMessage', payload)
 
-    def send_card(self, chat, text, markup, logo, fallback=None, last_resort=None, attempted=None):
+    def send_card(self, chat, text, markup, logo, fallback=None, last_resort=None, attempted=None, project=None):
         attempted = set() if attempted is None else attempted
         logos = logo if isinstance(logo, list) else [logo]
         if self.scanner and hasattr(self.scanner,'rank_images'):
             logos,sharp=self.scanner.rank_images(logos)
-            if not sharp and fallback:
+            if not sharp and fallback and not project:
                 logos,_=self.scanner.rank_images(logos+fallback())
                 fallback=None
         fits = caption_length(text) <= CAPTION_LIMIT
@@ -1952,7 +2013,15 @@ class Bot:
                     payload['reply_markup'] = markup
             try:
                 try:
-                    result = self.api('sendPhoto', payload)
+                    if project:
+                        try:
+                            result = self.api('sendPhoto', dict(payload, _upload_photo=True, _project=project))
+                        except (DeliveryRetryError, RateLimitError, TelegramRequestError):
+                            raise
+                        except DataError:
+                            result = self.api('sendPhoto', payload)
+                    else:
+                        result = self.api('sendPhoto', payload)
                 except TelegramRequestError as error:
                     if error.status != 400:
                         raise
@@ -1978,9 +2047,9 @@ class Bot:
             sent_photo = True
             break
         if not sent_photo and fallback and not limited:
-            return self.send_card(chat,text,markup,fallback(), last_resort=last_resort, attempted=attempted)
+            return self.send_card(chat,text,markup,fallback(), last_resort=last_resort, attempted=attempted, project=project)
         if not sent_photo and last_resort:
-            return self.send_card(chat,text,markup,last_resort(), attempted=attempted)
+            return self.send_card(chat,text,markup,last_resort(), attempted=attempted, project=project)
         if not sent_photo:
             print(f'Foto ausente: {len(attempted)} URL candidatas agotadas.', flush=True)
         return self.send(chat, text, markup)
@@ -2333,7 +2402,9 @@ class Bot:
                     if result:
                         self.scanner.store.card_snapshot(chat,msg['message_id'],current)
                     return result
-                result=self.send_card(chat,text,markup,logos,
+                base = pair.get('baseToken') or {}
+                project = (str(base.get('name') or 'Token'), str(base.get('symbol') or '?'))
+                result=self.send_card(chat,text,markup,logos,project=project,
                                       fallback=lambda:self.scanner.extra_images(arg),
                                       last_resort=lambda:self.scanner.solana_logos(arg))
                 if isinstance(result,dict) and result.get('message_id'):
