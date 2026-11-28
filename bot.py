@@ -85,6 +85,15 @@ def valid_address(value):
 GMGN_CHAINS = {'solana':'sol','ethereum':'eth','bsc':'bsc','base':'base','arbitrum':'arbitrum',
                'hyperevm':'hyperevm','robinhood':'robinhood','arc':'arc','stable':'stable','avalanche':'avalanche'}
 
+def valid_signature(value):
+    if not isinstance(value,str) or not re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{64,88}',value):
+        return False
+    n = 0
+    for c in value:
+        n = n * 58 + ALPHABET.index(c)
+    return (n.bit_length()+7)//8 + len(value)-len(value.lstrip('1')) == 64
+
+
 def valid_contract(value):
     return isinstance(value, str) and (valid_address(value) or bool(re.fullmatch(r'0x[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?', value)) or bool(re.fullmatch(r'T[1-9A-HJ-NP-Za-km-z]{33}', value)))
 
@@ -855,6 +864,110 @@ class Scanner:
         if not rows and 'next' in data and data['next'] in (None,''):
             return '🟢 No detectado'
         return '⚪ Sin verificar'
+
+    def dev_transfers(self, mint, creator):
+        """Inspect a bounded sample of finalized transactions signed by the creator."""
+        def rpc(method, params):
+            data = self.transport('https://api.mainnet-beta.solana.com',
+                                  {'jsonrpc':'2.0','id':1,'method':method,'params':params}, timeout=3)
+            return data.get('result') if isinstance(data, dict) else None
+
+        entries = rpc('getSignaturesForAddress', [creator, {'limit':3,'commitment':'finalized'}])
+        if not isinstance(entries, list):
+            return []
+        lines = []
+        for entry in entries[:3]:
+            sig = entry.get('signature') if isinstance(entry, dict) else None
+            if not valid_signature(sig) or entry.get('err') is not None:
+                continue
+            try:
+                tx = rpc('getTransaction', [sig, {'encoding':'jsonParsed','commitment':'finalized',
+                                                  'maxSupportedTransactionVersion':0}])
+            except DataError:
+                continue
+            if not isinstance(tx, dict):
+                continue
+            record = tx.get('transaction') or {}
+            meta = tx.get('meta') or {}
+            if meta.get('err', True) is not None or sig not in (record.get('signatures') or []):
+                continue
+            message = record.get('message') or {}
+            keys = message.get('accountKeys') or []
+            if not any(isinstance(k,dict) and k.get('pubkey')==creator and k.get('signer') for k in keys):
+                continue
+            accounts = {}
+            for b in (meta.get('preTokenBalances') or []) + (meta.get('postTokenBalances') or []):
+                idx = b.get('accountIndex')
+                if b.get('mint')==mint and type(idx) is int and 0<=idx<len(keys) and isinstance(keys[idx],dict):
+                    accounts[keys[idx].get('pubkey')] = b
+            instructions = list(message.get('instructions') or [])
+            for group in meta.get('innerInstructions') or []:
+                instructions.extend(group.get('instructions') or [])
+            for ix in instructions:
+                if ix.get('program') not in ('spl-token','spl-token-2022'):
+                    continue
+                parsed = ix.get('parsed') or {}
+                if parsed.get('type') not in ('transfer','transferChecked'):
+                    continue
+                info = parsed.get('info') or {}
+                src = accounts.get(info.get('source'), {})
+                dst = accounts.get(info.get('destination'), {}).get('owner')
+                if src.get('owner')!=creator or info.get('authority')!=creator or not valid_address(dst) or dst==creator:
+                    continue
+                raw = info.get('amount') or (info.get('tokenAmount') or {}).get('amount')
+                decimals = (src.get('uiTokenAmount') or {}).get('decimals')
+                if not isinstance(raw,str) or not re.fullmatch(r'[0-9]{1,20}',raw) or int(raw)==0 or type(decimals)!=int or not 0<=decimals<=255:
+                    continue
+                amount = format(Decimal(raw).scaleb(-decimals), 'f')
+                when = stamp(tx['blockTime']) if type(tx.get('blockTime')) is int else 'Hora desconocida'
+                lines.append(f'• {amount} tokens → <a href="https://solscan.io/account/{dst}">{dst[:6]}…{dst[-4:]}</a> · {when} · <a href="https://solscan.io/tx/{sig}">Transacción</a>')
+                if len(lines)==3:
+                    return lines
+        return lines
+
+    def investigation(self, mint):
+        report = self.solana_report(mint)
+        creator = report.get('creator')
+        if not valid_address(creator):
+            try:
+                token = self.gmgn_query('info', mint)
+                creator = (token.get('dev') or {}).get('creator_address') if token.get('address')==mint else None
+            except DataError:
+                creator = None
+        lines = ['🕵️ <b>EXPEDIENTE · SOLANA</b>', f'<code>{mint}</code>', '',
+                 '<b>Historial del DEV</b>']
+        transfers, history, sales = [], [], []
+        if valid_address(creator):
+            lines.append(f'<a href="https://solscan.io/account/{creator}">Billetera del creador · {creator[:6]}…{creator[-4:]}</a>')
+            def launches():
+                coins = self.transport('https://frontend-api-v3.pump.fun/coins/user-created/' + creator + '?offset=0&limit=10&includeNsfw=true', timeout=4)
+                return [f'• <a href="https://solscan.io/token/{c["mint"]}">{esc(c.get("name") or c["mint"][:8],40)}</a>'
+                        + (' · ' + stamp(c['created_timestamp']/1000) if type(c.get('created_timestamp')) is int and 0<c['created_timestamp']<4102444800000 else '')
+                        for c in coins if isinstance(c,dict) and c.get('creator')==creator and valid_address(c.get('mint')) and c['mint']!=mint][:3]
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                tasks = [pool.submit(launches), pool.submit(self.dev_transfers,mint,creator),
+                         pool.submit(self.gmgn_query,'dev_sales',mint,wallet=creator)]
+                for i,task in enumerate(tasks):
+                    try:
+                        data = task.result()
+                        if i==0: history=data
+                        elif i==1: transfers=data
+                        else:
+                            for row in data.get('activities') or []:
+                                sig=row.get('tx_hash')
+                                if (row.get('token') or {}).get('address')==mint and (row.get('event_type') or row.get('type'))=='sell' and valid_signature(sig):
+                                    sales.append(f'• Venta registrada por GMGN · <a href="https://solscan.io/tx/{sig}">Transacción</a>')
+                    except (DataError, TypeError, ValueError, AttributeError):
+                        continue
+        lines += history or ['Otros lanzamientos en Pump.fun: sin datos verificables.']
+        lines += ['', '<b>Transferencias directas del DEV</b>']
+        lines += transfers or ['Sin transferencias verificadas en la muestra.']
+        lines += ['Cobertura: hasta 3 transacciones recientes del creador.', '', '<b>Movimientos y avisos</b>']
+        risks = [esc(r['name'],90) for r in report.get('risks') or [] if isinstance(r,dict)
+                 and r.get('level') in ('warn','danger') and isinstance(r.get('name'),str)]
+        lines += (sales[:1] + ['⚠️ RugCheck · '+risk for risk in risks[:3]]) or ['Sin avisos verificables en las fuentes consultadas.']
+        lines += ['', f'<a href="https://rugcheck.xyz/tokens/{mint}">Informe RugCheck</a> · <a href="https://solscan.io/token/{mint}">Contrato en Solscan</a>', stamp(time.time())]
+        return '\n'.join(lines)
 
     def current_snipers(self, mint):
         try:return self.current_tag_holdings(mint,'sniper')
@@ -2174,7 +2287,8 @@ class Bot:
                     button['callback_data']=direct if verb=='scan' and len(direct.encode())<=64 else verb+':'+data
         if chain=='solana':
             label='📡 ASER'
-            markup['inline_keyboard'][4].append({'text':label,'callback_data':'aser:'+data})
+            markup['inline_keyboard'][4].append({'text':'🕵️ Investigar','callback_data':'investigar:'+mint})
+            markup['inline_keyboard'].insert(5,[{'text':label,'callback_data':'aser:'+data}])
             return markup
         q=urllib.parse.quote
         pool=pair.get('pairAddress')
@@ -2393,7 +2507,7 @@ class Bot:
                 self.scanner.store.preference(user, arg)
                 return self.send(chat, 'Preferencia guardada para tus próximas consultas.')
             return
-        if action not in ('scan', 'ath', 'holders', 'snipers', 'sources', 'security', 'srefresh', 'aser'):
+        if action not in ('scan', 'ath', 'holders', 'snipers', 'sources', 'security', 'srefresh', 'aser', 'investigar'):
             # Solo en privado se responde a comandos desconocidos; en grupos pueden ser de otros bots.
             if not callback and msg['chat'].get('type') == 'private':
                 return self.send(chat, HELP)
@@ -2490,6 +2604,10 @@ class Bot:
                 if isinstance(result,dict) and result.get('message_id'):
                     self.scanner.store.card_snapshot(chat,result['message_id'],current)
                 return result
+            if action=='investigar':
+                if chain != 'solana':
+                    return self.send(chat,'La investigación está disponible en Solana.')
+                return self.send(chat,self.scanner.investigation(arg))
             if action=='aser':
                 data=self.scanner.aser_signals(arg)
                 return self.send(chat,aser_report(arg,data),{'inline_keyboard':[[{'text':'Abrir ASER','url':'https://aser.trade/#/coin/'+arg}]]})
